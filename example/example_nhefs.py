@@ -1,8 +1,8 @@
 # example_att_est.py
 import numpy as np
 
-from UnifiedCausal import UnifiedCausalTester, CausalRules
-from minVarCatBoostTuner import MinVarCatBoostTuner
+from ..src.UnifiedCausal import UnifiedCausalTester, CausalRules
+from ..src.minVarCatBoostTuner import MinVarCatBoostTuner
 from causaldata import nhefs_complete
 
 

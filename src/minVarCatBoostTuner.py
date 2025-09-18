@@ -165,7 +165,7 @@ class MinVarCatBoostTuner:
             n_trials=self.n_trials,
             show_progress_bar=self.verbose,
             gc_after_trial=True,
-            n_jobs=-1,  # CatBoost 线程安全；多个 trial 并行容易抢核导致波动
+            n_jobs=1,  # CatBoost 线程安全；多个 trial 并行容易抢核导致波动
         )
 
         self.best_params_ = study.best_params
