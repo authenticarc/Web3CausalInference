@@ -1,3 +1,7 @@
+
+import sys
+sys.path.append(r"C:\Users\ASUS\Documents\GitHub\Web3CausalInference\src")
+
 # example_att_est.py
 import numpy as np
 

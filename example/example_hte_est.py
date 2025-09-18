@@ -1,3 +1,6 @@
+import sys
+sys.path.append(r"C:\Users\ASUS\Documents\GitHub\Web3CausalInference\src")
+
 # example_htt_est.py
 import numpy as np
 

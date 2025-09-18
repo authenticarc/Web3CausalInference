@@ -22,6 +22,7 @@ class MinVarCatBoostTuner:
         categories: Optional[str] = "auto",
         trim: float = 1e-3,            # e(x) 裁剪，提升稳定性
         verbose: bool = False,
+        reg_lf = None
     ):
         self.n_trials = n_trials
         self.n_splits = n_splits
@@ -34,6 +35,7 @@ class MinVarCatBoostTuner:
         self.best_value_: Optional[float] = None  # 最小方差
         self.best_reg_: Optional[CatBoostRegressor] = None
         self.best_clf_: Optional[CatBoostClassifier] = None
+        self.reg_lf = reg_lf
 
     # ---------- AIPW 伪效应 ψ：一致估计真效应 ---------- #
     @staticmethod
@@ -63,7 +65,10 @@ class MinVarCatBoostTuner:
         depth_clf = trial.suggest_int("clf_depth", 3, 8)
 
         # 回归损失选择（包含 Tweedie 的 variance_power）
-        reg_loss = trial.suggest_categorical("reg_loss", ["RMSE", "Tweedie"])
+        if self.reg_lf == 'RMSE':
+            reg_loss = trial.suggest_categorical("reg_loss", ["RMSE"])
+        else:
+            reg_loss = trial.suggest_categorical("reg_loss", ["RMSE", "Tweedie"])
         reg_tweedie_p = None
         if reg_loss == "Tweedie":
             reg_tweedie_p = trial.suggest_float("reg_tweedie_p", 1.1, 1.9)

@@ -30,6 +30,7 @@ class NAUUCCatBoostTunerV2:
         min_nauuc: Optional[float] = None,   # 例如 0.35；None 表示不设门槛
         max_ci_width: Optional[float] = None, # 例如 2.5（原尺度）；None 表示不设门槛
         verbose: bool = False,
+        reg_lf = None
     ):
         self.n_trials = n_trials
         self.n_splits = n_splits
@@ -45,6 +46,7 @@ class NAUUCCatBoostTunerV2:
         self.best_value_: Optional[float] = None
         self.best_reg_: Optional[CatBoostRegressor] = None
         self.best_clf_: Optional[CatBoostClassifier] = None
+        self.reg_lf = reg_lf
 
     # ---------- AIPW ψ / 影响函数 φ / nAUUC ---------- #
     @staticmethod
@@ -91,7 +93,11 @@ class NAUUCCatBoostTunerV2:
         depth_clf = trial.suggest_int("clf_depth", 3, 8)
 
         # 回归损失（含 Tweedie）
-        reg_loss = trial.suggest_categorical("reg_loss", ["RMSE", "Tweedie"])
+        if self.reg_lf == 'RMSE':
+            reg_loss = trial.suggest_categorical("reg_loss", ["RMSE"])
+        else:
+            reg_loss = trial.suggest_categorical("reg_loss", ["RMSE", "Tweedie"])
+            
         reg_tweedie_p = None
         if reg_loss == "Tweedie":
             reg_tweedie_p = trial.suggest_float("reg_tweedie_p", 1.1, 1.9)

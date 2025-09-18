@@ -5,14 +5,9 @@ import numpy as np
 
 from UnifiedCausal import UnifiedCausalTester, CausalRules
 from minVarCatBoostTuner import MinVarCatBoostTuner
-from nAUUCCatBoostTuner import NAUUCCatBoostTuner
 from NAUUCCatBoostTunerV2 import NAUUCCatBoostTunerV2
 from causaldata import nhefs_complete
-
-
 import pandas as pd
-import os.path
-import os
 
 try:
     df = nhefs_complete.load_pandas().data.copy()
@@ -51,7 +46,7 @@ rules = CausalRules(
     placebo_alpha=0.09, nc_alpha=0.10, top_k_smd=8
 )
 
-reg, clf = MinVarCatBoostTuner(verbose=0,n_trials=50).fit_return_models(X,T,Y)
+reg, clf = NAUUCCatBoostTunerV2(verbose=0,n_trials=50,reg_lf='RMSE').fit_return_models(X,T,Y)
 
 common_kwargs = dict(
     n_splits=5,
