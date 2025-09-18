@@ -6,7 +6,7 @@ sys.path.append(r"C:\Users\ASUS\Documents\GitHub\Web3CausalInference\src")
 import numpy as np
 
 from UnifiedCausal import UnifiedCausalTester, CausalRules
-from nAUUCCatBoostTuner import NAUUCCatBoostTuner
+from NAUUCCatBoostTuner import NAUUCCatBoostTuner
 from minVarCatBoostTuner import MinVarCatBoostTuner
 
 import pandas as pd
