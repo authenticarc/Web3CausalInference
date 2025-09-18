@@ -1,8 +1,12 @@
-# example_att_est.py
+import sys
+sys.path.append(r"C:\Users\ASUS\Documents\GitHub\Web3CausalInference\src")
+
 import numpy as np
 
-from ..src.UnifiedCausal import UnifiedCausalTester, CausalRules
-from ..src.minVarCatBoostTuner import MinVarCatBoostTuner
+from UnifiedCausal import UnifiedCausalTester, CausalRules
+from minVarCatBoostTuner import MinVarCatBoostTuner
+from nAUUCCatBoostTuner import NAUUCCatBoostTuner
+from NAUUCCatBoostTunerV2 import NAUUCCatBoostTunerV2
 from causaldata import nhefs_complete
 
 
@@ -10,7 +14,6 @@ import pandas as pd
 import os.path
 import os
 
-# ===== 1) 数据地址 =====
 try:
     df = nhefs_complete.load_pandas().data.copy()
 except Exception:
@@ -34,7 +37,6 @@ if "bmi" in df.columns and "bmix" not in df.columns:
     covs.append("bmi")
 
 # --- 构造 X / T / Y ---
-df = df.dropna()
 X_df = pd.get_dummies(df[covs], drop_first=True)   # one-hot → 全数值
 X = X_df.to_numpy()
 feature_names = list(X_df.columns)
@@ -49,7 +51,7 @@ rules = CausalRules(
     placebo_alpha=0.09, nc_alpha=0.10, top_k_smd=8
 )
 
-reg, clf = MinVarCatBoostTuner(verbose=0,n_trials=300).fit_return_models(X,T,Y)
+reg, clf = MinVarCatBoostTuner(verbose=0,n_trials=50).fit_return_models(X,T,Y)
 
 common_kwargs = dict(
     n_splits=5,
@@ -64,6 +66,7 @@ common_kwargs = dict(
     regressor=reg,
     classifier=clf
 )
+
 
 # ===== 3) ATE =====
 print("\n=== ATE on full sample ===")
@@ -82,5 +85,5 @@ print(f"Overlap-band coverage (treated kept): "
     f"= {(T[band]==1).sum()/(T==1).sum():.1%}")
 
 att_band = UnifiedCausalTester(estimand="ATT", **common_kwargs)
-att_band.fit(X[band], T[band], Y[band], X_names=X_names, y_nc=y_nc, placebo_runs=10)
+att_band.fit(X[band], T[band], Y[band], X_names=feature_names, y_nc=y_nc, placebo_runs=10)
 print(att_band.report())
