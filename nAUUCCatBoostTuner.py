@@ -68,8 +68,8 @@ class NAUUCCatBoostTuner:
             "subsample": trial.suggest_float("reg_subsample", 0.7, 1.0),
             "random_seed": self.random_seed,
             "verbose": 0,
-            # 'loss_function':f'Tweedie:variance_power=1.3',
-            # 'eval_metric':f'Tweedie:variance_power=1.3'
+            'loss_function':f'Tweedie:variance_power=1.3',
+            'eval_metric':f'Tweedie:variance_power=1.3'
         }
         clf_params = {
             "depth": trial.suggest_int("clf_depth", 3, 8),
@@ -142,7 +142,8 @@ class NAUUCCatBoostTuner:
         study = optuna.create_study(direction="maximize")
         study.optimize(lambda tr: self._objective(tr, X, T, Y),
                        n_trials=self.n_trials,
-                       show_progress_bar=self.verbose,n_jobs=-1,callbacks=[stop_callback])
+                       show_progress_bar=self.verbose,n_jobs=-1,callbacks=[stop_callback],
+                       gc_after_trial=True)
 
         self.best_params_ = study.best_params
         self.best_value_ = study.best_value
@@ -154,8 +155,8 @@ class NAUUCCatBoostTuner:
             subsample=self.best_params_["reg_subsample"],
             random_seed=self.random_seed,
             verbose=0,
-            # loss_function=f'Tweedie:variance_power=1.3',
-            # eval_metric=f'Tweedie:variance_power=1.3',
+            loss_function=f'Tweedie:variance_power=1.3',
+            eval_metric=f'Tweedie:variance_power=1.3',
         )
         self.best_clf_ = CatBoostClassifier(
             depth=self.best_params_["clf_depth"],
