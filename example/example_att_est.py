@@ -1,8 +1,6 @@
 # example_att_est.py
 import numpy as np
 
-import sys
-sys.path.append('/Users/clyde.ren/Documents/causalinference/src')  # 目录，而不是文件
 from UnifiedCausal import UnifiedCausalTester, CausalRules
 from nAUUCCatBoostTuner import NAUUCCatBoostTuner
 from minVarCatBoostTuner import MinVarCatBoostTuner

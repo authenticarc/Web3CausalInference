@@ -1,8 +1,6 @@
 # example_htt_est.py
 import numpy as np
 
-import sys
-sys.path.append('/Users/clyde.ren/Documents/causalinference/src')  # 目录，而不是文件
 import pandas as pd
 from DistilledPolicy import  compute_teacher_oof_tau_psi_aligned, fit_rule_catboost_single_tree, evaluate_rule_model,evaluate_rules_per_leaf, extract_rules_from_catboost_single_tree
 
