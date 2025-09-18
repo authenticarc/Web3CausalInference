@@ -89,7 +89,7 @@ print(att_band.report())
 # ===== 7) HTE & Policy（可选）=====
 hte = HTETester(
     tune_nauuc=True,
-    n_trials=300,
+    n_trials=50,
     reg_loss="RMSE",
     reg_tweedie_p=1.3,
     nauuc_band=(0.3, 0.7),
