@@ -9,27 +9,33 @@ from DistilledPolicy import  compute_teacher_oof_tau_psi_aligned, fit_rule_catbo
 import os
 import os.path
 
+# import multiprocessing as mp, os, gc, tempfile
+# mp.set_start_method("spawn", force=True)  # 关键：macOS 上禁止 fork
+# os.environ.setdefault("OMP_NUM_THREADS", "1")
+# os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
+
 # ===== 1) 数据地址 =====
 raw_path = '/Users/clyde.ren/Documents/causalinference/data' # 修改
 res_path = '/Users/clyde.ren/Documents/causalinference/result' # 修改
-res_name = 'result_hte_convert.txt'
+res_name = 'id89.txt'
 
 files = list(os.listdir(raw_path))
-files = ['/Users/clyde.ren/Documents/causalinference/data/tmp_20250909_clyde_ren_casual_inference_fomo_review_10u_convert_df_id82_watermarked.xlsx'] # 修改
+files = ['/Users/clyde.ren/Documents/causalinference/data/tmp_20250916_clyde_ren_casual_inference_fomo_review_10u_active_df_fomo_id89_watermarked.xlsx'] # 修改
 #[i for i in files if 'convert' in i]
 
 for file in files:
     FILE_PATH = os.path.join(raw_path, file)
     print(FILE_PATH)
 
-    df = pd.read_excel(FILE_PATH)
     # 修改特征预处理逻辑
+    df = pd.read_excel(FILE_PATH)
     df['before_amt'] = np.log1p(df['before_amt'])
     df['token_trade_success_amt_usd'] = np.log1p(df['token_trade_success_amt_usd'])
     df['btc_price'] = np.log1p(df['btc_price'])
-    df['after_amt'] = np.log1p(df['after_amt'])
 
-    num_features = ['token_trade_success_amt_usd', 'btc_price', 'btc_ptr', 'btc_std', 'last_7d_active_days', 'act_cnts','before_amt']
+    num_features = [
+        'token_trade_success_amt_usd', 'btc_price', 'btc_ptr', 'btc_std', 'before_act_days','create_diff','act_cnts','before_amt'
+        ]
     # 类别特征
     df = pd.get_dummies(df, columns=['region_name'], drop_first=True)
     cat_features = [c for c in df.columns if c.startswith("region_name_")]
@@ -40,7 +46,7 @@ for file in files:
     df = df.dropna()
     X = df[features].values
     T = df['t'].astype(int).values
-    Y = df['after_amt'].astype(float).values
+    Y = df['after_act_days'].astype(float).values
     X_names = features
 
     y_nc = None
