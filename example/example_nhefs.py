@@ -1,5 +1,5 @@
 import sys
-sys.path.append(r"C:\Users\ASUS\Documents\GitHub\Web3CausalInference\src")
+sys.path.append(r"/Users/clyde.ren/Documents/causalinference/src")
 
 import numpy as np
 
