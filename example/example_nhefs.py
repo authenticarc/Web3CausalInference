@@ -119,7 +119,7 @@ except Exception as e:
 df['label'] = df.apply(lambda row: 'strong' if row['lb_99'] > 0 else 'medium' if row['lb_90']> 0 else 'none',axis=1)
 
 # 统计各类用户数量与占比
-treated_df = df[df['t'] == 1]
+treated_df = df[df['qsmk'] == 1]
 
 stats = treated_df['label'].value_counts(normalize=True).rename("proportion").to_frame()
 stats['count'] = treated_df['label'].value_counts()
