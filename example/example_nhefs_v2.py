@@ -144,51 +144,52 @@ att_band.fit(X[band], T[band], Y[band], X_names=feature_names, y_nc=y_nc, placeb
 print(att_band.report())
 
 
-# # ===== 7) HTE & Policy（可选）=====
-# hte = HTETester(
-#     tune_nauuc=True,
-#     n_trials=50,
-#     reg_loss="RMSE",
-#     reg_tweedie_p=1.3,
-#     nauuc_band=(0.3, 0.7),
-#     n_splits=5,
-#     trim=0.008,
-#     min_nauuc=0.35,      # 门槛
-#     random_state=42,
-#     verbose=1
-# )
-# dr = hte.fit(X, T, Y)      # 训练并返回 DR 模型
-# report = hte.report()
-# print(report)
+# ===== 7) HTE & Policy（可选）=====
+hte = HTETester(
+    tune_nauuc=True,
+    n_trials=50,
+    reg_loss="RMSE",
+    reg_tweedie_p=1.3,
+    nauuc_band=(0.3, 0.7),
+    n_splits=5,
+    trim=0.008,
+    min_nauuc=0.35,      # 门槛
+    random_state=42,
+    verbose=1
+)
+dr = hte.fit(X, T, Y)      # 训练并返回 DR 模型
+report = hte.report()
+print(report)
 
-# tau_hat = dr.effect(X)
-# df['htt'] = tau_hat
+tau_hat = dr.effect(X)
+df['htt'] = tau_hat
 
-# try:
-#     lb_90, ub_90 = dr.effect_interval(X, alpha=0.1)
-#     df['lb_90'] = lb_90; df['ub_90'] = ub_90
-#     lb_99, ub_99 = dr.effect_interval(X, alpha=0.01)
-#     df['lb_99'] = lb_99; df['ub_99'] = ub_99
-# except Exception as e:
-#     print(f"[Warn] effect_interval 计算失败：{e}")
-#     for c in ('lb_90','ub_90','lb_99','ub_99'):
-#         df[c] = np.nan
+try:
+    lb_90, ub_90 = dr.effect_interval(X, alpha=0.1)
+    df['lb_90'] = lb_90; df['ub_90'] = ub_90
+    lb_99, ub_99 = dr.effect_interval(X, alpha=0.01)
+    df['lb_99'] = lb_99; df['ub_99'] = ub_99
+except Exception as e:
+    print(f"[Warn] effect_interval 计算失败：{e}")
+    for c in ('lb_90','ub_90','lb_99','ub_99'):
+        df[c] = np.nan
 
-# df['label'] = df.apply(lambda row: 'strong' if row['lb_99'] > 0 else 'medium' if row['lb_90']> 0 else 'none',axis=1)
+df['label'] = df.apply(lambda row: 'strong' if row['lb_99'] > 0 else 'medium' if row['lb_90']> 0 else 'none',axis=1)
 
-# # 统计各类用户数量与占比
-# treated_df = df[df['t'] == 1]
+# 统计各类用户数量与占比
+treated_df = df[df['t'] == 1]
 
-# stats = treated_df['label'].value_counts(normalize=True).rename("proportion").to_frame()
-# stats['count'] = treated_df['label'].value_counts()
-# stats['proportion'] = stats['proportion'].round(4)
+stats = treated_df['label'].value_counts(normalize=True).rename("proportion").to_frame()
+stats['count'] = treated_df['label'].value_counts()
+stats['proportion'] = stats['proportion'].round(4)
 
-# print("=== HTT 实验组用户分布 ===")
-# stat_res = []
-# for lbl, row in stats.iterrows():
-#     stat_res.append(f"{lbl:7s}: {row['count']} ({row['proportion']:.4f})")
-#     print(f"{lbl:7s}: {row['count']} ({row['proportion']:.4f})")
-# stat_res = "\n".join(stat_res)
+print("=== HTT 实验组用户分布 ===")
+stat_res = []
+for lbl, row in stats.iterrows():
+    stat_res.append(f"{lbl:7s}: {row['count']} ({row['proportion']:.4f})")
+    print(f"{lbl:7s}: {row['count']} ({row['proportion']:.4f})")
+stat_res = "\n".join(stat_res)
+print(stat_res)
 
 # # ---------- 与 HTETester/HTE 模型对接 ----------
 
