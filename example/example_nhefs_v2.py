@@ -1,23 +1,27 @@
+# -*- coding: utf-8 -*-
 import sys
 sys.path.append(r"C:\Users\ASUS\Documents\GitHub\Web3CausalInference\src")
 
 import numpy as np
+import pandas as pd
 
 from UnifiedCausal import UnifiedCausalTester, CausalRules
-from NAUUCCatBoostTunerV3 import NAUUCCatBoostTunerV3
+from NAUUCCatBoostTunerV2 import NAUUCCatBoostTunerV2
 from causaldata import nhefs_complete
-import pandas as pd
-from DistilledPolicy import  compute_teacher_oof_tau_psi_aligned, fit_rule_catboost_single_tree, evaluate_rule_model,evaluate_rules_per_leaf, extract_rules_from_catboost_single_tree
+from DistilledPolicy import compute_teacher_oof_tau_psi_aligned, fit_rule_catboost_single_tree, evaluate_rule_model, evaluate_rules_per_leaf, extract_rules_from_catboost_single_tree
 from HTETester import HTETester
 
+# 新增：深特征工厂
+from DeepFeatureFactory import DeepFeatureFactory
+
+# ===================== 1) 数据加载 =====================
 try:
     df = nhefs_complete.load_pandas().data.copy()
 except Exception:
     df = nhefs_complete.load_pandas().copy()
 
 t_col = "qsmk"
-y_col = "wt82_71"
-y_nc_col = None
+y_col = "wt82_71"   # 连续结局（体重变化）
 
 # 协变量（可按需增减；以下为常见一组）
 base_covs = [
@@ -27,34 +31,89 @@ base_covs = [
     "wt71", "ht", "bmix",  # bmix 若不存在，可用 bmi
     "alcohol", "marital"
 ]
-# 兼容：若某些列不存在，自动剔除
 covs = [c for c in base_covs if c in df.columns]
 if "bmi" in df.columns and "bmix" not in df.columns:
     covs.append("bmi")
 
-# --- 构造 X / T / Y ---
-X_df = pd.get_dummies(df[covs], drop_first=True)   # one-hot → 全数值
-X = X_df.to_numpy()
-feature_names = list(X_df.columns)
+# ===================== 2) 先用 DeepFeatureFactory 生成特征 =====================
+# 拆分类别与数值列（这里按“常识列名”粗分；也可以用 df.dtypes 自适应）
+cat_cols = [c for c in covs if c in {"sex","race","education","exercise","active","marital"} and c in df.columns]
+num_cols = [c for c in covs if c not in cat_cols and c in df.columns]
 
+# 组内聚合的 key（可按需增减）
+group_keys = [["sex"], ["race"], ["education"]]
+group_keys = [g for g in group_keys if all(k in df.columns for k in g)]
+
+# 准备工厂输入表
+base_X = df[cat_cols + num_cols].copy()
+# 目标用于 OOF-TE/叶子嵌入：用连续结局 y（也可以换成 ψ，更贴因果排序，但此处用 y 更简单）
+Y_series = df[y_col].astype(float)
+# y 中的 NaN 用中位数兜底，避免目标编码/叶子训练报错
+y_for_factory = Y_series.fillna(Y_series.median()).to_numpy()
+
+# 建立工厂
+factory = DeepFeatureFactory(
+    cat_cols=cat_cols,
+    num_cols=num_cols,
+    group_keys=group_keys,
+    # 编码/统计
+    enable_target_encoding=True,   # OOF-TE，用 y 监督
+    enable_count_freq=True,
+    enable_woe=False,              # y 为连续，WoE 关闭
+    enable_groupby_agg=True,
+    agg_funcs=("mean","median","std","count","nunique"),
+    # 数值派生
+    add_log1p=True,
+    add_ratios=True,
+    add_interactions=True,
+    max_interactions=120,
+    quantile_bins=12,
+    # 多项式/AutoFeat
+    add_poly2=True,
+    autofeat_steps=0,              # 如需更深可设 1（更慢）
+    # 树叶子特征
+    add_leaf_embeddings=False,
+    leaf_task="reg",               # y 连续 → 回归叶子
+    leaf_rounds=600,
+    leaf_depth=6,
+    leaf_lr=0.05,
+    # 降维
+    add_pca=12,
+    scale_before_pca=True,
+    # 控规模
+    max_total_cols=100,
+    # 打印
+    verbose=1
+)
+
+print("\n[STEP] 生成深特征矩阵 …")
+X_deep_df = factory.fit_transform(base_X, y=y_for_factory)
+feature_names = list(X_deep_df.columns)
+X = X_deep_df.to_numpy()
+
+# 处理 T / Y
 T = df[t_col].to_numpy().ravel().astype(int)
-Y = df[y_col].to_numpy().ravel().astype(float)
-y_nc = None
+Y = Y_series.to_numpy().ravel().astype(float)
+y_nc = None  # 没有负控，这里保持 None
 
-# ===== 2) 公共规则 & 估计器配置（按需调快/调严）=====
+print(f"[INFO] 深特征完成 | X shape = {X.shape}, 原始 cov 数 = {len(covs)}, 输出特征数 = {len(feature_names)}")
+
+# ===================== 3) Causal 估计器与规则配置 =====================
 rules = CausalRules(
     smd_max=0.3, ovl_min=0.50, ks_max=0.60, ess_min=0.70,
     placebo_alpha=0.09, nc_alpha=0.10, top_k_smd=8
 )
 
-reg, clf = NAUUCCatBoostTunerV3(verbose=0,n_trials=50,reg_lf='RMSE').fit_return_models(X,T,Y)
+# 这里的 tuner 仍然只返回 reg / clf（不改对外 API）
+print("\n[STEP] NAUUCCatBoostTunerV2 超参调优（用于 DR 的底模） …")
+reg, clf = NAUUCCatBoostTunerV2(verbose=0, n_trials=50, reg_lf='RMSE').fit_return_models(X, T, Y)
 
 common_kwargs = dict(
     n_splits=5,
     trim=0.01,
-    ps_clip=(0.05, 0.95),     # PS 裁剪，稳健
-    weight_clip=10.0,         # 权重裁剪，稳健
-    n_jobs=-1,                 # 单测/示例下设 1；真跑可以开大
+    ps_clip=(0.05, 0.95),
+    weight_clip=10.0,
+    n_jobs=-1,
     n_jobs_placebo=-1,
     random_state=2025,
     verbose=0,
@@ -63,22 +122,22 @@ common_kwargs = dict(
     classifier=clf
 )
 
-
-# ===== 3) ATE =====
-print("\n=== ATE on full sample ===")
+# ===================== 4) ATE on full sample =====================
+print("\n=== ATE on full sample (with DeepFeatureFactory features) ===")
 ate = UnifiedCausalTester(estimand="ATE", **common_kwargs)
-ate.fit(X, T, Y, X_names=covs, y_nc=None, placebo_runs=10)
+# X_names 应该传入“深特征名”以便报告里显示
+ate.fit(X, T, Y, X_names=feature_names, y_nc=None, placebo_runs=10)
 print(ate.report())
 
 # 取得 OOF 倾向分数，后面做重叠带
 e_oof = ate.result_["diag"]["e"]
 
-# ===== 6) “重叠带” ATT（可选，更稳的口径）=====
+# ===================== 5) ATT on overlap band e∈[0.3,0.7] =====================
 print("\n=== ATT on overlap band e∈[0.3,0.7] (recommended when overlap is weak) ===")
 band = (e_oof >= 0.3) & (e_oof <= 0.7)
 print(f"Overlap-band coverage (treated kept): "
-    f"{int((T[band]==1).sum())}/{int((T==1).sum())} "
-    f"= {(T[band]==1).sum()/(T==1).sum():.1%}")
+      f"{int((T[band]==1).sum())}/{int((T==1).sum())} "
+      f"= {(T[band]==1).sum()/(T==1).sum():.1%}")
 
 att_band = UnifiedCausalTester(estimand="ATT", **common_kwargs)
 att_band.fit(X[band], T[band], Y[band], X_names=feature_names, y_nc=y_nc, placebo_runs=10)
