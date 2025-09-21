@@ -243,7 +243,7 @@ class HTETester:
 
         pruner = optuna.pruners.MedianPruner(n_startup_trials=20)
         study = optuna.create_study(direction="maximize", pruner=pruner)
-        study.optimize(objective, n_trials=self.n_trials, show_progress_bar=True, n_jobs=-1,callbacks=[stop_callback])
+        study.optimize(objective, n_trials=self.n_trials, show_progress_bar=True, n_jobs=1,callbacks=[stop_callback])
 
         self.study_ = study
         best = study.best_trial
