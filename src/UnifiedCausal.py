@@ -145,7 +145,7 @@ class UnifiedCausalTester:
                  rules: CausalRules = CausalRules(),
                  verbose: int = 1,
                  # === nAUUC 相关开关 ===
-                 compute_nauuc: bool = True,
+                 compute_nauuc: bool = False,
                  nauuc_band=(0.3, 0.7),
                  nauuc_policy_ks=(0.1, 0.2, 0.3)):
         assert estimand in {"ATE","ATT","ATO"}

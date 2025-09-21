@@ -70,6 +70,7 @@ class DeepFeatureFactory:
         leaf_rounds: int = 500,
         leaf_depth: int = 6,
         leaf_lr: float = 0.05,
+        leaf_lf: str = "RMSE",  # 仅回归可选
         add_pca: int = 0,            # >0 输出 PC 数量
         scale_before_pca: bool = True,
         # 产出控制
@@ -111,6 +112,7 @@ class DeepFeatureFactory:
         self.leaf_rounds = int(leaf_rounds)
         self.leaf_depth = int(leaf_depth)
         self.leaf_lr = float(leaf_lr)
+        self.leaf_lf = leaf_lf
 
         self.add_pca = int(add_pca)
         self.scale_before_pca = bool(scale_before_pca)
@@ -385,9 +387,9 @@ class DeepFeatureFactory:
         params = dict(iterations=self.leaf_rounds, depth=self.leaf_depth,
                       learning_rate=self.leaf_lr, random_seed=self.random_state, verbose=False)
         if task == "clf":
-            model = CatBoostClassifier(loss_function="Logloss", **params)
+            model = CatBoostClassifier(loss_function=self.leaf_lf, **params)
         else:
-            model = CatBoostRegressor(loss_function="RMSE", **params)
+            model = CatBoostRegressor(loss_function=self.leaf_lf, **params)
         model.fit(Xcb, y)
         self._leaf_model = model
         try:

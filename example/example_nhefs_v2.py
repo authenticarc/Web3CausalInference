@@ -72,7 +72,7 @@ factory = DeepFeatureFactory(
     add_poly2=True,
     autofeat_steps=0,              # 如需更深可设 1（更慢）
     # 树叶子特征
-    add_leaf_embeddings=False,
+    add_leaf_embeddings=True,
     leaf_task="reg",               # y 连续 → 回归叶子
     leaf_rounds=600,
     leaf_depth=6,
@@ -81,7 +81,7 @@ factory = DeepFeatureFactory(
     add_pca=12,
     scale_before_pca=True,
     # 控规模
-    max_total_cols=100,
+    max_total_cols=30,
     # 打印
     verbose=1
 )
@@ -106,7 +106,7 @@ rules = CausalRules(
 
 # 这里的 tuner 仍然只返回 reg / clf（不改对外 API）
 print("\n[STEP] NAUUCCatBoostTunerV2 超参调优（用于 DR 的底模） …")
-reg, clf = NAUUCCatBoostTunerV2(verbose=0, n_trials=10, reg_lf='RMSE').fit_return_models(X, T, Y)
+reg, clf = NAUUCCatBoostTunerV2(verbose=0, n_trials=20, reg_lf='RMSE').fit_return_models(X, T, Y)
 
 common_kwargs = dict(
     n_splits=5,
