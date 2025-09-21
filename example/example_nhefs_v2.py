@@ -106,7 +106,7 @@ rules = CausalRules(
 
 # 这里的 tuner 仍然只返回 reg / clf（不改对外 API）
 print("\n[STEP] NAUUCCatBoostTunerV2 超参调优（用于 DR 的底模） …")
-reg, clf = NAUUCCatBoostTunerV2(verbose=0, n_trials=50, reg_lf='RMSE').fit_return_models(X, T, Y)
+reg, clf = NAUUCCatBoostTunerV2(verbose=0, n_trials=10, reg_lf='RMSE').fit_return_models(X, T, Y)
 
 common_kwargs = dict(
     n_splits=5,

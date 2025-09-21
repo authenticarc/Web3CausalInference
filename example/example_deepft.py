@@ -173,6 +173,7 @@ if __name__ == "__main__":
         add_poly2=True,
         add_leaf_embeddings=True,
         add_pca=12,
+        max_total_cols=256,
         verbose=2,   # << 看详细日志
     )
 

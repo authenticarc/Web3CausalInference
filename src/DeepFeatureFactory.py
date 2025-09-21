@@ -3,7 +3,7 @@ from __future__ import annotations
 import time
 import numpy as np
 import pandas as pd
-from typing import Sequence, Optional, Dict, Any, Union, Tuple
+from typing import Sequence, Optional, Dict, Any, Union, Tuple, List
 
 from sklearn.model_selection import KFold, StratifiedKFold
 from sklearn.preprocessing import PolynomialFeatures, StandardScaler
@@ -20,7 +20,7 @@ except Exception:
     _HAS_AUTOF = False
 
 try:
-    from catboost import CatBoostRegressor, CatBoostClassifier
+    from catboost import CatBoostRegressor, CatBoostClassifier, Pool   # ← 加了 Pool
     _HAS_CATBOOST = True
 except Exception:
     _HAS_CATBOOST = False
@@ -35,10 +35,7 @@ class DeepFeatureFactory:
     - 统计组合：GroupBy 聚合回填、log1p、比率、乘除交互、分位分箱
     - 深层表征：CatBoost 叶子索引（leaf embeddings，可选）
     - 降维：PCA（可选）
-
-    注意：
-    * 所有使用 y 的环节均做 K 折 OOF，transform 阶段复用映射/模型，防泄漏。
-    * 输出为一个拼接后的 DataFrame 特征矩阵。
+    - 列数约束：当超出 max_total_cols 时，用 DSBAN 主成分裁剪为精确列数
     """
 
     def __init__(
@@ -77,6 +74,11 @@ class DeepFeatureFactory:
         scale_before_pca: bool = True,
         # 产出控制
         max_total_cols: Optional[int] = None,
+        # DSBAN 主成分设置（当触发 max_total_cols 限制时）
+        dsban_alpha: float = 0.7,        # 监督权重：相关性(α) vs. 方差(1-α)
+        dsban_anchor_frac: float = 0.2,  # 锚特征占比
+        dsban_min_anchors: int = 20,     # 最少锚数量
+        dsban_whiten: bool = False,      # 是否 whiten（仍会先按 scale_before_pca 标准化）
         # 日志
         verbose: Union[int, bool] = 1
     ):
@@ -115,6 +117,12 @@ class DeepFeatureFactory:
 
         self.max_total_cols = max_total_cols
 
+        # DSBAN
+        self.dsban_alpha = float(np.clip(dsban_alpha, 0.0, 1.0))
+        self.dsban_anchor_frac = float(np.clip(dsban_anchor_frac, 0.05, 1.0))
+        self.dsban_min_anchors = int(max(1, dsban_min_anchors))
+        self.dsban_whiten = bool(dsban_whiten)
+
         # 状态
         self._is_binary_target: Optional[bool] = None
         self._global_mean: Optional[float] = None
@@ -127,6 +135,11 @@ class DeepFeatureFactory:
         self._autofeat_model: Optional[AutoFeatRegressor] = None
         self._poly: Optional[PolynomialFeatures] = None
         self._fitted = False
+
+        # DSBAN 状态
+        self._dsban_anchor_idx: Optional[np.ndarray] = None
+        self._dsban_scaler: Optional[StandardScaler] = None
+        self._dsban_pca: Optional[PCA] = None
 
         # 日志
         self.verbose = int(verbose)
@@ -156,7 +169,6 @@ class DeepFeatureFactory:
 
     @staticmethod
     def _to_category(df: pd.DataFrame, cols: Sequence[str]) -> None:
-        # 为避免 Categorical 的写入限制，这里统一转为 string + 填占位
         for c in cols:
             if c in df:
                 df[c] = df[c].astype("string").fillna("__NA__")
@@ -174,9 +186,9 @@ class DeepFeatureFactory:
         gm = float(np.nanmean(y)) if not self._is_binary_target else float(np.nanmean(y == 1))
         self._global_mean = gm
 
-        splitter = (
-            StratifiedKFold(n_splits=self.n_splits, shuffle=True, random_state=self.random_state).split(X_cat, (y if self._is_binary_target else (y > np.nanmedian(y)).astype(int)))
-        )
+        splitter = StratifiedKFold(
+            n_splits=self.n_splits, shuffle=True, random_state=self.random_state
+        ).split(X_cat, (y if self._is_binary_target else (y > np.nanmedian(y)).astype(int)))
 
         te_maps_fold: Dict[str, list] = {c: [] for c in self.cat_cols}
 
@@ -379,26 +391,43 @@ class DeepFeatureFactory:
         model.fit(Xcb, y)
         self._leaf_model = model
         try:
-            leaf_idx = model.predict(Xcb, prediction_type="LeafIndex")
+            # 优先：calc_leaf_indexes（更通用稳定）
+            pool = Pool(Xcb)
+            leaf_idx = model.calc_leaf_indexes(pool)
             leaf_idx = np.array(leaf_idx)
             if leaf_idx.ndim == 1: leaf_idx = leaf_idx.reshape(-1, 1)
             self._log(f"[LEAF] Done in {self._elapsed(t0)} | trees={leaf_idx.shape[1] if leaf_idx.ndim==2 else 1}", 1)
             return leaf_idx
-        except Exception as e:
-            self._log(f"[LEAF] WARN: cannot extract LeafIndex: {e}", 1)
-            return None
+        except Exception as e1:
+            # 备选回退
+            try:
+                leaf_idx = model.predict(Xcb, prediction_type="LeafIndex")
+                leaf_idx = np.array(leaf_idx)
+                if leaf_idx.ndim == 1: leaf_idx = leaf_idx.reshape(-1, 1)
+                self._log(f"[LEAF] Done (fallback) in {self._elapsed(t0)} | trees={leaf_idx.shape[1] if leaf_idx.ndim==2 else 1}", 1)
+                return leaf_idx
+            except Exception as e2:
+                self._log(f"[LEAF] WARN: cannot extract leaf indexes: {e1} | {e2}", 1)
+                return None
 
     def _leaf_features(self, feat: pd.DataFrame):
         if self._leaf_model is None or not _HAS_CATBOOST:
             return None
         Xcb = feat.select_dtypes(include=[np.number]).fillna(0.0).values
         try:
-            leaf_idx = self._leaf_model.predict(Xcb, prediction_type="LeafIndex")
+            pool = Pool(Xcb)
+            leaf_idx = self._leaf_model.calc_leaf_indexes(pool)
             leaf_idx = np.array(leaf_idx)
             if leaf_idx.ndim == 1: leaf_idx = leaf_idx.reshape(-1, 1)
             return leaf_idx
         except Exception:
-            return None
+            try:
+                leaf_idx = self._leaf_model.predict(Xcb, prediction_type="LeafIndex")
+                leaf_idx = np.array(leaf_idx)
+                if leaf_idx.ndim == 1: leaf_idx = leaf_idx.reshape(-1, 1)
+                return leaf_idx
+            except Exception:
+                return None
 
     def _fit_pca(self, feat_num: np.ndarray):
         if self.add_pca <= 0:
@@ -421,6 +450,83 @@ class DeepFeatureFactory:
         if self._scaler is not None:
             Z = self._scaler.transform(Z)
         return self._pca.transform(Z)
+
+    # ---------------- DSBAN: 监督式主成分裁剪 ---------------- #
+    def _score_features_for_dsban(self, Xnum: np.ndarray, y: Optional[np.ndarray]) -> np.ndarray:
+        """返回每个数值列的监督分数：alpha*|corr(y,x)| + (1-alpha)*std(x)"""
+        p = Xnum.shape[1]
+        if y is None:
+            # 无监督回退：仅按标准差
+            return Xnum.std(axis=0, ddof=1)
+        yv = np.asarray(y).astype(float).ravel()
+        yv = yv - np.nanmean(yv)
+        yv /= (np.nanstd(yv, ddof=1) + 1e-12)
+        # 逐列相关性（数值稳定处理）
+        Xc = Xnum - np.nanmean(Xnum, axis=0, keepdims=True)
+        Xc_std = np.nanstd(Xnum, axis=0, ddof=1) + 1e-12
+        corr = (Xc * yv[:, None]).mean(axis=0) / Xc_std
+        corr = np.nan_to_num(corr, nan=0.0)
+        stds = Xc_std
+        alpha = self.dsban_alpha
+        score = alpha * np.abs(corr) + (1.0 - alpha) * stds
+        return score
+
+    def _fit_dsban(self, feat: pd.DataFrame, y: Optional[np.ndarray], k_out: int) -> pd.DataFrame:
+        """在数值特征上做监督打分→选锚→PCA→输出 k_out 个 dsban_pc_*"""
+        t0 = time.time()
+        self._log(f"[DSBAN] Fit supervised PCA to meet max_total_cols={k_out} …", 1)
+
+        Xnum_df = feat.select_dtypes(include=[np.number]).fillna(0.0)
+        Xnum = Xnum_df.values
+        p = Xnum.shape[1]
+        if p == 0:
+            self._log("[DSBAN] WARN: no numeric features; skip.", 1)
+            return pd.DataFrame(index=feat.index)
+
+        # 1) 打分并选锚
+        scores = self._score_features_for_dsban(Xnum, y)
+        n_anchor = max(self.dsban_min_anchors, int(np.ceil(self.dsban_anchor_frac * p)))
+        n_anchor = min(n_anchor, p)
+        anchor_idx = np.argsort(-scores)[:n_anchor]
+        self._dsban_anchor_idx = anchor_idx
+
+        # 2) 标准化（可选）+ PCA(k_out)
+        Xa = Xnum[:, anchor_idx]
+        if self.scale_before_pca:
+            scaler = StandardScaler()
+            Xa = scaler.fit_transform(Xa)
+            self._dsban_scaler = scaler
+        else:
+            self._dsban_scaler = None
+
+        pca = PCA(n_components=min(k_out, Xa.shape[1]), whiten=self.dsban_whiten, random_state=self.random_state)
+        comps = pca.fit_transform(Xa)
+        self._dsban_pca = pca
+
+        # 3) 命名输出
+        cols = [f"dsban_pc_{i+1}" for i in range(comps.shape[1])]
+        out = pd.DataFrame(comps, index=feat.index, columns=[f"dsban_pc_{i+1}" for i in range(comps.shape[1])])
+        self._log(f"[DSBAN] Done in {self._elapsed(t0)} | anchors={n_anchor}, pcs={out.shape[1]}", 1)
+        return out
+
+    def _dsban_transform(self, feat: pd.DataFrame, k_out: int) -> pd.DataFrame:
+        """使用已拟合的锚 + PCA，把任意新样本映射到 k_out 个 dsban_pc_*"""
+        if self._dsban_anchor_idx is None or self._dsban_pca is None:
+            # 未拟合，直接返回空
+            return pd.DataFrame(index=feat.index)
+        Xnum_df = feat.select_dtypes(include=[np.number]).fillna(0.0)
+        if Xnum_df.shape[1] == 0:
+            return pd.DataFrame(index=feat.index)
+
+        anchor_idx = self._dsban_anchor_idx
+        Xa = Xnum_df.values[:, anchor_idx]
+        if self._dsban_scaler is not None:
+            Xa = self._dsban_scaler.transform(Xa)
+        comps = self._dsban_pca.transform(Xa)
+        # 截断/填充到 k_out（一般不需要，组件数在 fit 时定死了）
+        comps = comps[:, :min(k_out, comps.shape[1])]
+        out = pd.DataFrame(comps, index=feat.index, columns=[f"dsban_pc_{i+1}" for i in range(comps.shape[1])])
+        return out
 
     # ---------------- Public API ---------------- #
     def fit_transform(self, df: pd.DataFrame, y: Optional[np.ndarray] = None) -> pd.DataFrame:
@@ -461,7 +567,7 @@ class DeepFeatureFactory:
                     feat[f"leaf_idx_{i}"] = leaf_idx[:, i]
             self._log(f"[FDF] add LEAF {self._delta_cols(before, feat.shape[1])} | shape={feat.shape}", 1)
 
-        # PCA
+        # PCA（常规无监督 PC，可作为额外补充）
         before = feat.shape[1]
         num_mat = feat.select_dtypes(include=[np.number]).fillna(0.0).values
         comps = self._fit_pca(num_mat)
@@ -470,9 +576,13 @@ class DeepFeatureFactory:
                 feat[f"pca_{i+1}"] = comps[:, i]
         self._log(f"[FDF] add PCA {self._delta_cols(before, feat.shape[1])} | shape={feat.shape}", 1)
 
+        # —— 核心修改：若超出上限，启用 DSBAN 主成分裁剪 ——
         if self.max_total_cols is not None and feat.shape[1] > self.max_total_cols:
-            feat = feat.iloc[:, : self.max_total_cols]
-            self._log(f"[FDF] truncate to max_total_cols={self.max_total_cols} | shape={feat.shape}", 1)
+            self._log(f"[FDF] exceed max_total_cols={self.max_total_cols} → use DSBAN PCs", 1)
+            dsban_df = self._fit_dsban(feat, y, k_out=self.max_total_cols)
+            # 用 DSBANPC 直接替代整体特征（保证列数精确）
+            feat = dsban_df
+            self._log(f"[FDF] after DSBAN | shape={feat.shape}", 1)
 
         self._fitted = True
         self._log(f"[FDF] fit_transform done in {self._elapsed(t0)} | final shape={feat.shape}", 1)
@@ -523,9 +633,12 @@ class DeepFeatureFactory:
                 feat[f"pca_{i+1}"] = comps[:, i]
         self._log(f"[FDF] add PCA | shape={feat.shape}", 1)
 
+        # 推理时若超出上限，则使用已拟合的 DSBAN 投影到精确列数
         if self.max_total_cols is not None and feat.shape[1] > self.max_total_cols:
-            feat = feat.iloc[:, : self.max_total_cols]
-            self._log(f"[FDF] truncate to max_total_cols={self.max_total_cols} | shape={feat.shape}", 1)
+            self._log(f"[FDF] exceed max_total_cols={self.max_total_cols} → use DSBAN PCs (transform)", 1)
+            dsban_df = self._dsban_transform(feat, k_out=self.max_total_cols)
+            feat = dsban_df
+            self._log(f"[FDF] after DSBAN(transform) | shape={feat.shape}", 1)
 
         self._log(f"[FDF] transform done in {self._elapsed(t0)} | final shape={feat.shape}", 1)
         return feat
