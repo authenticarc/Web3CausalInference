@@ -3,16 +3,71 @@ import numpy as np, optuna
 from sklearn.base import clone
 from sklearn.model_selection import StratifiedKFold, KFold
 from sklearn.calibration import CalibratedClassifierCV
-from catboost import CatBoostClassifier, CatBoostRegressor
-from econml.dr import ForestDRLearner
+
+import pandas as pd
+import xgboost as xgb
+from pandas.api.types import (
+    is_numeric_dtype, is_integer_dtype, is_string_dtype,
+    is_categorical_dtype, is_datetime64_any_dtype
+)
+
+# ============ 小工具 ============
+
+def _area_cumgain_centered(psi, scores):
+    order = np.argsort(-scores)
+    psi_ord = psi[order]
+    psi_c = psi_ord - psi_ord.mean()
+    csum = np.cumsum(psi_c)
+    x = np.arange(1, len(csum)+1) / len(csum)
+    return float(np.trapz(csum, x))
+
+def _policy_values(psi, scores, ks=(0.1,0.2,0.3)):
+    out = {}
+    order = np.argsort(-scores)
+    psi_ord = psi[order]
+    n = len(psi_ord)
+    for k in ks:
+        m = max(1, int(np.floor(n * k)))
+        out[f'policy@{int(k*100)}'] = float(np.sum(psi_ord[:m]))
+    return out
+
+def _aipw_pseudo(y, t, mu1, mu0, e, trim=1e-3):
+    e = np.clip(e, trim, 1 - trim)
+    return (t*(y - mu1)/e) - ((1-t)*(y - mu0)/(1-e)) + (mu1 - mu0)
+
+# ============ 轻量 DR 模型包装 ============
+
+class DRModel:
+    """轻量封装：提供 effect(X)；X 可为 DataFrame（将使用 tester 的编码映射）"""
+    def __init__(self, tester, ps_model, m1_model, m0_model, tau_model, trim=1e-3):
+        self._tester = tester
+        self.ps_model = ps_model
+        self.m1_model = m1_model
+        self.m0_model = m0_model
+        self.tau_model = tau_model
+        self.trim = float(trim)
+
+    def effect(self, X):
+        X_enc = self._tester._encode_X(X)
+        return self.tau_model.predict(X_enc)
+
+    def propensity(self, X):
+        X_enc = self._tester._encode_X(X)
+        return np.clip(self.ps_model.predict_proba(X_enc)[:,1], self.trim, 1-self.trim)
+
+    def mu_hat(self, X):
+        X_enc = self._tester._encode_X(X)
+        return self.m1_model.predict(X_enc), self.m0_model.predict(X_enc)
+
+# ============ 主类：HTETester（XGBoost + DR + 自动编码） ============
 
 class HTETester:
     """
-    只负责 HTE 训练：
+    只负责 HTE 训练（XGBoost + 手写 DR-learner）：
       - （可选）以 nAUUC 为目标做超参与带选择
-      - 在选定 overlap 带内训练 ForestDRLearner
-      - fit(...) 返回训练好的 ForestDRLearner 实例
-      - report() 仅在 fit 之后调用；使用 fit 时缓存的数据生成可用性报告
+      - 在选定 overlap 带内训练 DR：ps/m1/m0 + tau head（XGBRegressor）
+      - fit(...) 返回 DRModel（.effect(X) 可直接对原始 DataFrame 打分）
+      - report() 使用 fit 时缓存的数据生成可用性报告
     """
     def __init__(self,
                  regressor=None,
@@ -21,15 +76,22 @@ class HTETester:
                  trim=0.01,
                  nauuc_band=(0.3, 0.7),
                  nauuc_policy_ks=(0.1, 0.2, 0.3),
-                 min_nauuc=0.35,          # 可用性门槛
+                 min_nauuc=0.35,
                  tune_nauuc=False,
                  n_trials=200,
                  early_stop=0.60,
-                 search_forest_head=True,
-                 reg_loss="auto",          # 'RMSE'|'Tweedie'|'auto'
+                 search_tau_head=True,     # ← 原来的 search_forest_head 改名
+                 reg_loss="auto",          # 'rmse'|'tweedie'|'auto'
                  reg_tweedie_p=1.3,
+                 use_gpu=False,
                  random_state=42,
-                 verbose=1):
+                 verbose=1,
+                 # 自动编码配置
+                 auto_encode_cats=True,
+                 int_as_cat_unique_thresh=30,
+                 unique_ratio_thresh=0.05,
+                 rare_freq_ratio=0.001,
+                 max_onehot_levels=200):
         self.n_splits = int(n_splits)
         self.trim = float(trim)
         self.nauuc_band = tuple(nauuc_band)
@@ -38,30 +100,35 @@ class HTETester:
         self.tune_nauuc = bool(tune_nauuc)
         self.n_trials = int(n_trials)
         self.early_stop = early_stop
-        self.search_forest_head = bool(search_forest_head)
-        self.reg_loss = reg_loss
+        self.search_tau_head = bool(search_tau_head)
+        self.reg_loss = reg_loss.lower() if isinstance(reg_loss, str) else "auto"
         self.reg_tweedie_p = float(reg_tweedie_p)
         self.random_state = int(random_state)
         self.verbose = int(verbose)
 
+        # 设备参数（XGBoost 2.0+ 推荐）
+        self._device_args = {"tree_method": "hist", "device": ("cuda" if use_gpu else "cpu")}
+
         # base learners（可被调参覆盖）
-        self.regressor = regressor or CatBoostRegressor(
-            depth=8, learning_rate=0.05, l2_leaf_reg=3.0,
-            subsample=0.9, verbose=0, random_seed=random_state,
-            loss_function="RMSE"
+        self.regressor = regressor or xgb.XGBRegressor(
+            objective="reg:squarederror",
+            max_depth=6, learning_rate=0.05, n_estimators=400,
+            subsample=0.9, colsample_bytree=0.9, reg_lambda=3.0,
+            random_state=self.random_state, n_jobs=1, **self._device_args
         )
-        self.classifier = classifier or CatBoostClassifier(
-            depth=6, learning_rate=0.05, l2_leaf_reg=3.0,
-            subsample=0.9, auto_class_weights="Balanced",
-            verbose=0, random_state=random_state
+        self.classifier = classifier or xgb.XGBClassifier(
+            objective="binary:logistic", eval_metric="logloss",
+            max_depth=6, learning_rate=0.05, n_estimators=400,
+            subsample=0.9, colsample_bytree=0.9, reg_lambda=3.0,
+            random_state=self.random_state, n_jobs=1, **self._device_args
         )
 
-        # ForestDR 头部
-        self.forest_head = dict(
-            n_estimators=800, max_depth=12, min_samples_split=4, min_samples_leaf=10,
-            max_features='sqrt', max_samples=0.4, min_balancedness_tol=0.5,
-            honest=True, subforest_size=4, cv=3, min_propensity=1e-3,
-            categories='auto', random_state=random_state, n_jobs=-1
+        # tau head（XGBRegressor 的默认头部，可被调参覆盖）
+        self.tau_head = dict(
+            max_depth=6, n_estimators=600, learning_rate=0.05,
+            subsample=0.8, colsample_bytree=0.8, reg_lambda=3.0,
+            min_child_weight=5, objective="reg:squarederror",
+            random_state=self.random_state, n_jobs=-1, **self._device_args
         )
 
         # 输出/缓存
@@ -70,43 +137,102 @@ class HTETester:
         self._dr = None
         self._cache = dict()  # 存放用于 report 的数据与指标
 
-    # ---------- 工具 ----------
-    @staticmethod
-    def _aipw_pseudo(y, t, mu1, mu0, e, trim=1e-3):
-        e = np.clip(e, trim, 1 - trim)
-        return (t*(y - mu1)/e) - ((1-t)*(y - mu0)/(1-e)) + (mu1 - mu0)
+        # 自动编码映射
+        self.auto_encode_cats = bool(auto_encode_cats)
+        self.int_as_cat_unique_thresh = int(int_as_cat_unique_thresh)
+        self.unique_ratio_thresh = float(unique_ratio_thresh)
+        self.rare_freq_ratio = float(rare_freq_ratio)
+        self.max_onehot_levels = int(max_onehot_levels)
+        self._cat_levels_ = {}
+        self._colnames_ = None
 
-    @staticmethod
-    def _area_cumgain_centered(psi, scores):
-        order = np.argsort(-scores)
-        psi_ord = psi[order]
-        psi_c = psi_ord - psi_ord.mean()
-        csum = np.cumsum(psi_c)
-        x = np.arange(1, len(csum)+1) / len(csum)
-        return float(np.trapz(csum, x))
+    # ---------- 自动识别 & 稳定编码 ----------
+    def _infer_cats(self, X: pd.DataFrame):
+        cats = []
+        n = len(X)
+        for c in X.columns:
+            s = X[c]
+            if is_datetime64_any_dtype(s):
+                continue
+            nunq = s.nunique(dropna=False)
+            ur = nunq / max(n, 1)
+            is_cat = (
+                is_string_dtype(s) or is_categorical_dtype(s) or
+                (is_integer_dtype(s) and nunq <= self.int_as_cat_unique_thresh) or
+                (not is_numeric_dtype(s) and ur <= self.unique_ratio_thresh)
+            )
+            if (not is_cat) and is_numeric_dtype(s) and nunq <= self.int_as_cat_unique_thresh:
+                is_cat = True
+            if is_cat:
+                cats.append(c)
+        return cats
 
-    @staticmethod
-    def _policy_values(psi, scores, ks=(0.1,0.2,0.3)):
-        out = {}
-        order = np.argsort(-scores)
-        psi_ord = psi[order]
-        n = len(psi_ord)
-        for k in ks:
-            m = max(1, int(np.floor(n * k)))
-            out[f'policy@{int(k*100)}'] = float(np.sum(psi_ord[:m]))
+    def _fit_cat_maps(self, X: pd.DataFrame, cat_cols):
+        self._cat_levels_.clear()
+        n = len(X); rare_thresh = max(int(self.rare_freq_ratio*n), 1)
+        for c in cat_cols:
+            vc = X[c].astype("string").fillna("__NA__").value_counts(dropna=False)
+            common = vc[vc >= rare_thresh].index.tolist()
+            if len(common) > self.max_onehot_levels:
+                common = list(vc.index[: self.max_onehot_levels])
+            self._cat_levels_[c] = ["__RARE__"] + [str(v) for v in common]
+
+    def _apply_cat_maps(self, X: pd.DataFrame, cat_cols):
+        X2 = X.copy()
+        for c in cat_cols:
+            X2[c] = X2[c].astype("string").fillna("__NA__")
+            levels = set(self._cat_levels_[c][1:])
+            X2[c] = X2[c].apply(lambda v: v if v in levels else "__RARE__")
+        dummies = []
+        for c in cat_cols:
+            cats = pd.Categorical(X2[c], categories=self._cat_levels_[c])
+            dummies.append(pd.get_dummies(cats, prefix=c, dummy_na=False))
+        D = pd.concat(dummies, axis=1) if dummies else pd.DataFrame(index=X2.index)
+        num_cols = [c for c in X.columns if c not in cat_cols and is_numeric_dtype(X[c])]
+        X_num = X[num_cols].apply(pd.to_numeric, errors="coerce")
+        out = pd.concat([X_num, D], axis=1).fillna(0.0)
         return out
 
+    def _encode_X_fit(self, X):
+        if not self.auto_encode_cats or not isinstance(X, pd.DataFrame):
+            Xn = np.asarray(X, float)
+            self._colnames_ = [f"x{j}" for j in range(Xn.shape[1])]
+            return Xn
+        cats = self._infer_cats(X)
+        self._fit_cat_maps(X, cats)
+        Xenc = self._apply_cat_maps(X, cats)
+        self._colnames_ = list(Xenc.columns)
+        return Xenc.to_numpy(float, copy=False)
+
+    def _encode_X(self, X):
+        if not self.auto_encode_cats or not isinstance(X, pd.DataFrame):
+            Xn = np.asarray(X, float)
+            if self._colnames_ is None:
+                self._colnames_ = [f"x{j}" for j in range(Xn.shape[1])]
+            return Xn
+        cat_cols = list(self._cat_levels_.keys())
+        Xenc = self._apply_cat_maps(X, cat_cols)
+        for c in self._colnames_:
+            if c not in Xenc.columns:
+                Xenc[c] = 0.0
+        Xenc = Xenc[self._colnames_]
+        return Xenc.to_numpy(float, copy=False)
+
+    # ---------- OOF 倾向 ----------
     def _oof_propensity(self, X, T, clf_proto, trim=None):
         trim = self.trim if trim is None else trim
         e_oof = np.zeros(len(T), float)
         skf = StratifiedKFold(n_splits=self.n_splits, shuffle=True, random_state=self.random_state)
         for tr, va in skf.split(X, T):
             clf = clone(clf_proto)
+            # 避免内部并行太多
+            try: clf.set_params(n_jobs=1)
+            except: pass
             clf.fit(X[tr], T[tr])
             e_oof[va] = clf.predict_proba(X[va])[:, 1]
         return np.clip(e_oof, trim, 1 - trim)
 
-    # 更稳的回归器拟合（防 Tweedie 在小样本/常数目标时崩）
+    # ---------- 稳健回归器小工具 ----------
     def _safe_fit_predict_reg(self, reg, X_tr, y_tr, X_va,
                               min_n=30, min_std=1e-8, zero_share_cap=0.98):
         y_tr = np.asarray(y_tr, float)
@@ -117,125 +243,133 @@ class HTETester:
         reg.fit(X_tr, y_tr)
         return reg.predict(X_va)
 
-    def _oof_nauuc_on_band(self, Xb, Tb, Yb, reg_proto, clf_proto, forest_kwargs, trim=None):
+    # ---------- 在带内用 DR 流程做 OOF nAUUC ----------
+    def _oof_nauuc_on_band(self, Xb, Tb, Yb, reg_proto, clf_proto, tau_params, trim=None):
         trim = self.trim if trim is None else trim
         psi_oof = np.full(len(Xb), np.nan); tau_oof = np.full(len(Xb), np.nan)
         kf = KFold(n_splits=self.n_splits, shuffle=True, random_state=self.random_state)
         for tr, va in kf.split(Xb):
             X_tr, X_va = Xb[tr], Xb[va]; T_tr, T_va = Tb[tr], Tb[va]; Y_tr, Y_va = Yb[tr], Yb[va]
-            clf = clone(clf_proto).fit(X_tr, T_tr)
+
+            clf = clone(clf_proto)
+            try: clf.set_params(n_jobs=1)
+            except: pass
+            clf.fit(X_tr, T_tr)
+            e_tr = np.clip(clf.predict_proba(X_tr)[:,1], trim, 1-trim)
             e_va = np.clip(clf.predict_proba(X_va)[:,1], trim, 1-trim)
 
-            reg1 = clone(reg_proto); reg0 = clone(reg_proto)
-            mu1_va = np.zeros(len(va)); mu0_va = np.zeros(len(va))
-            if (T_tr==1).any(): mu1_va = self._safe_fit_predict_reg(reg1, X_tr[T_tr==1], Y_tr[T_tr==1], X_va)
-            if (T_tr==0).any(): mu0_va = self._safe_fit_predict_reg(reg0, X_tr[T_tr==0], Y_tr[T_tr==0], X_va)
-            psi_oof[va] = self._aipw_pseudo(Y_va, T_va, mu1_va, mu0_va, e_va, trim=trim)
-
             if (T_tr==1).any() and (T_tr==0).any():
-                dr = ForestDRLearner(model_regression=clone(reg_proto),
-                                     model_propensity=clone(clf_proto),
-                                     **forest_kwargs)
-                dr.fit(Y_tr, T_tr, X=X_tr)
-                tau_oof[va] = dr.effect(X_va)
+                reg1 = clone(reg_proto); reg0 = clone(reg_proto)
+                try: reg1.set_params(n_jobs=1); reg0.set_params(n_jobs=1)
+                except: pass
+                mu1_va = self._safe_fit_predict_reg(reg1, X_tr[T_tr==1], Y_tr[T_tr==1], X_va)
+                mu0_va = self._safe_fit_predict_reg(reg0, X_tr[T_tr==0], Y_tr[T_tr==0], X_va)
+
+                # 训练折上拟合 tau head
+                mu1_tr = self._safe_fit_predict_reg(clone(reg_proto), X_tr[T_tr==1], Y_tr[T_tr==1], X_tr)
+                mu0_tr = self._safe_fit_predict_reg(clone(reg_proto), X_tr[T_tr==0], Y_tr[T_tr==0], X_tr)
+                m_tr = e_tr * mu1_tr + (1 - e_tr) * mu0_tr
+                Z_tr = ((T_tr - e_tr) / (e_tr * (1 - e_tr))) * (Y_tr - m_tr)
+                w_tr = e_tr * (1 - e_tr)
+
+                tau_model = xgb.XGBRegressor(**tau_params)
+                tau_model.fit(X_tr, Z_tr, sample_weight=w_tr)
+                tau_oof[va] = tau_model.predict(X_va)
+
+                psi_oof[va] = _aipw_pseudo(Y_va, T_va, mu1_va, mu0_va, e_va, trim=trim)
 
         m = ~np.isnan(psi_oof) & ~np.isnan(tau_oof)
         if m.sum() < max(30, 2*self.n_splits):
             return 0.0, dict(note="too few valid oof points", n=int(m.sum()))
         psi_m, tau_m = psi_oof[m], tau_oof[m]
-        area_model  = self._area_cumgain_centered(psi_m, tau_m)
-        area_oracle = self._area_cumgain_centered(psi_m, psi_m)
+        area_model  = _area_cumgain_centered(psi_m, tau_m)
+        area_oracle = _area_cumgain_centered(psi_m, psi_m)
         nauuc = float(np.clip(area_model/area_oracle, 0.0, 1.0)) if abs(area_oracle) > 1e-12 else 0.0
-        pol = self._policy_values(psi_m, tau_m, ks=self.nauuc_policy_ks)
+        pol = _policy_values(psi_m, tau_m, ks=self.nauuc_policy_ks)
         return nauuc, dict(area_model=area_model, area_oracle=area_oracle, n=int(m.sum()), **pol)
 
     # ---------- 构建器 ----------
-    def _ensure_divisible(self, frh: dict):
-        frh = frh.copy()
-        s = int(frh.get('subforest_size', 1) or 1)
-        n = int(frh.get('n_estimators', 100))
-        if n % s != 0:
-            frh['n_estimators'] = int((n + s - 1) // s * s)
-        return frh
-
-    def _build_forest_head(self, trial):
-        if not self.search_forest_head:
-            return self._ensure_divisible(self.forest_head)
-        s = trial.suggest_int("fr_subforest_size", 2, 8)
-        m = trial.suggest_int("fr_num_subforests", 10, 30)
-        frh = dict(
-            n_estimators=s * m,
-            subforest_size=s,
-            max_depth=trial.suggest_int("fr_max_depth", 4, 8),
-            min_samples_split=trial.suggest_int("fr_min_split", 2, 20),
-            min_samples_leaf=trial.suggest_int("fr_min_leaf", 5, 50),
-            max_features=trial.suggest_categorical("fr_max_features", ["auto","sqrt","log2", 0.5, 0.8]),
-            max_samples=trial.suggest_float("fr_max_samples", 0.3, 0.5),
-            min_balancedness_tol=trial.suggest_float("fr_min_bal_tol", 0.3, 0.5),
-            honest=trial.suggest_categorical("fr_honest", [True, False]),
-            cv=trial.suggest_int("fr_cv", 2, 5),
-            categories='auto', random_state=self.random_state, n_jobs=-1
-        )
-        return frh
-
     def _build_reg(self, trial):
-        if self.reg_loss in ("RMSE","Tweedie"):
-            loss_choice = self.reg_loss
+        # 选择损失
+        if self.reg_loss in ("rmse", "tweedie"):
+            loss = self.reg_loss
         else:
-            loss_choice = trial.suggest_categorical("reg_loss", ["RMSE", "Tweedie"])
+            loss = trial.suggest_categorical("reg_loss", ["rmse", "tweedie"])
         params = dict(
-            depth=trial.suggest_int("reg_depth", 4, 8),
+            max_depth=trial.suggest_int("reg_max_depth", 3, 8),
             learning_rate=trial.suggest_float("reg_lr", 1e-3, 0.3, log=True),
-            l2_leaf_reg=trial.suggest_float("reg_l2", 1e-2, 10.0, log=True),
-            random_seed=self.random_state, verbose=0,
+            n_estimators=trial.suggest_int("reg_n_estimators", 300, 1200),
+            subsample=trial.suggest_float("reg_subsample", 0.6, 1.0),
+            colsample_bytree=trial.suggest_float("reg_colsample_bytree", 0.6, 1.0),
+            reg_lambda=trial.suggest_float("reg_lambda", 0.0, 10.0),
+            min_child_weight=trial.suggest_int("reg_min_child_weight", 1, 15),
+            random_state=self.random_state, n_jobs=1, **self._device_args
         )
-        if loss_choice == "RMSE":
-            params.update(loss_function="RMSE", eval_metric="RMSE")
+        if loss == "tweedie":
+            p = self.reg_tweedie_p if self.reg_loss=="tweedie" else trial.suggest_float("reg_tweedie_p", 1.1, 1.9)
+            params.update(objective="reg:tweedie", tweedie_variance_power=p)
         else:
-            vp = self.reg_tweedie_p if self.reg_loss=="Tweedie" else trial.suggest_float("reg_tweedie_p", 1.1, 1.8)
-            params.update(loss_function=f"Tweedie:variance_power={vp}",
-                          eval_metric=f"Tweedie:variance_power={vp}")
-        return CatBoostRegressor(**params)
+            params.update(objective="reg:squarederror")
+        return xgb.XGBRegressor(**params)
 
     def _build_clf(self, trial):
         params = dict(
-            depth=trial.suggest_int("clf_depth", 3, 8),
+            objective="binary:logistic", eval_metric="logloss",
+            max_depth=trial.suggest_int("clf_max_depth", 3, 8),
             learning_rate=trial.suggest_float("clf_lr", 1e-3, 0.3, log=True),
-            l2_leaf_reg=trial.suggest_float("clf_l2", 1e-2, 10.0, log=True),
-            auto_class_weights=trial.suggest_categorical("clf_class_wt", [None, "Balanced", "SqrtBalanced"]),
-            random_seed=self.random_state, verbose=0,
+            n_estimators=trial.suggest_int("clf_n_estimators", 300, 1200),
+            subsample=trial.suggest_float("clf_subsample", 0.6, 1.0),
+            colsample_bytree=trial.suggest_float("clf_colsample_bytree", 0.6, 1.0),
+            reg_lambda=trial.suggest_float("clf_reg_lambda", 0.0, 10.0),
+            min_child_weight=trial.suggest_int("clf_min_child_weight", 1, 15),
+            random_state=self.random_state, n_jobs=1, **self._device_args
         )
-        base = CatBoostClassifier(**params)
+        base = xgb.XGBClassifier(**params)
         calib = trial.suggest_categorical("ps_calibration", ["none", "isotonic", "sigmoid"])
         if calib == "none":
             return base
-        else:
-            cv = trial.suggest_int("ps_calib_cv", 2, 5)
-            return CalibratedClassifierCV(estimator=base, method=calib, cv=cv)
+        cv = trial.suggest_int("ps_calib_cv", 2, 5)
+        return CalibratedClassifierCV(estimator=base, method=calib, cv=cv)
+
+    def _build_tau_head(self, trial):
+        if not self.search_tau_head:
+            return self.tau_head.copy()
+        params = dict(
+            max_depth=trial.suggest_int("tau_max_depth", 3, 8),
+            learning_rate=trial.suggest_float("tau_lr", 1e-3, 0.3, log=True),
+            n_estimators=trial.suggest_int("tau_n_estimators", 400, 1500),
+            subsample=trial.suggest_float("tau_subsample", 0.6, 1.0),
+            colsample_bytree=trial.suggest_float("tau_colsample_bytree", 0.6, 1.0),
+            reg_lambda=trial.suggest_float("tau_reg_lambda", 0.0, 10.0),
+            min_child_weight=trial.suggest_int("tau_min_child_weight", 1, 15),
+            objective="reg:squarederror",
+            random_state=self.random_state, n_jobs=-1, **self._device_args
+        )
+        return params
 
     def _tune_by_nauuc(self, X, T, Y, base_band):
         def objective(trial):
             reg = self._build_reg(trial)
             clf = self._build_clf(trial)
-            frh = self._build_forest_head(trial)
+            tau_params = self._build_tau_head(trial)
             trim = trial.suggest_float("trim", 1e-3, 5e-2, log=True)
 
             e_oof = self._oof_propensity(X, T, clf, trim=trim)
-            lo = float(self.nauuc_band[0])  # 固定下界
+            lo = float(self.nauuc_band[0])
             band = (e_oof >= lo) & (e_oof <= 1 - lo)
             if band.sum() < max(100, 3*self.n_splits):
                 band = base_band
 
-            nauuc, stats = self._oof_nauuc_on_band(X[band], T[band], Y[band], reg, clf, frh, trim=trim)
+            nauuc, stats = self._oof_nauuc_on_band(X[band], T[band], Y[band], reg, clf, tau_params, trim=trim)
             cov = float(band.mean()); effn = int(stats.get("n", 0))
             if effn < max(120, 3*self.n_splits): nauuc *= 0.6
             if cov < 0.25: nauuc *= 0.85
-
             trial.set_user_attr("cov", cov); trial.set_user_attr("n_eff", effn)
+
             if (self.early_stop is not None) and (nauuc >= self.early_stop):
                 trial.study.stop()
             return float(nauuc)
-        
+
         def stop_callback(study, trial):
             if study.best_value is not None and study.best_value >= 0.35:
                 print(f"🎉 提前停止：best nAUUC={study.best_value:.3f} ≥ 0.35")
@@ -243,7 +377,7 @@ class HTETester:
 
         pruner = optuna.pruners.MedianPruner(n_startup_trials=20)
         study = optuna.create_study(direction="maximize", pruner=pruner)
-        study.optimize(objective, n_trials=self.n_trials, show_progress_bar=True, n_jobs=1,callbacks=[stop_callback])
+        study.optimize(objective, n_trials=self.n_trials, show_progress_bar=True, n_jobs=1, callbacks=[stop_callback])
 
         self.study_ = study
         best = study.best_trial
@@ -251,7 +385,7 @@ class HTETester:
         # 用最佳超参重建模型与带
         best_reg = self._build_reg(best)
         best_clf = self._build_clf(best)
-        best_frh = self._build_forest_head(best)
+        best_tau = self._build_tau_head(best)
         best_trim = best.params.get("trim", self.trim)
         lo_best = float(self.nauuc_band[0])
 
@@ -262,7 +396,7 @@ class HTETester:
         # 覆盖实例属性
         self.regressor = best_reg
         self.classifier = best_clf
-        self.forest_head = best_frh
+        self.tau_head = best_tau
         self.trim = best_trim
         self.nauuc_band = (float(lo_best), float(1 - lo_best))
         return best_band
@@ -270,61 +404,78 @@ class HTETester:
     # ---------- 训练 ----------
     def fit(self, X, T, Y):
         """
-        训练 ForestDRLearner 并返回训练好的 dr 模型（不做全量打分）
+        训练 DR（ps/m1/m0 + τ head）并返回 DRModel
         同时在内部缓存用于 report() 的评估所需数据
         """
-        X = np.asarray(X); T = np.asarray(T).astype(int); Y = np.asarray(Y).astype(float)
+        # 先确立编码映射
+        X_enc_full = self._encode_X_fit(X)
+        T = np.asarray(T).astype(int)
+        Y = np.asarray(Y).astype(float)
 
         # 保底带：用当前 classifier 的 OOF-PS
-        e_base = self._oof_propensity(X, T, self.classifier, trim=self.trim)
+        e_base = self._oof_propensity(X_enc_full, T, self.classifier, trim=self.trim)
         lo0, hi0 = self.nauuc_band
         base_band = (e_base >= lo0) & (e_base <= hi0)
 
         # 可选：nAUUC 调参
         if self.tune_nauuc:
             if self.verbose: print("[NAUUCTuner] running...")
-            best_band = self._tune_by_nauuc(X, T, Y, base_band=base_band)
+            best_band = self._tune_by_nauuc(X_enc_full, T, Y, base_band=base_band)
             if self.verbose and self.study_ is not None:
                 print(f"[NAUUCTuner] best_params={self.study_.best_params}, best_value={self.study_.best_value:.3f}")
         else:
             best_band = base_band
 
-        # 训练 DR 模型（仅带内）
-        dr_learner = ForestDRLearner(
-            model_regression=self.regressor,
-            model_propensity=self.classifier,
-            **self.forest_head
-        )
-        dr_learner.fit(Y[best_band], T[best_band], X=X[best_band])
+        # —— 带内训练 ps/m1/m0 —— #
+        Xb, Tb, Yb = X_enc_full[best_band], T[best_band], Y[best_band]
+
+        ps_model = clone(self.classifier)
+        try: ps_model.set_params(n_jobs=-1)
+        except: pass
+        ps_model.fit(Xb, Tb)
+        e_b = np.clip(ps_model.predict_proba(Xb)[:,1], self.trim, 1-self.trim)
+
+        reg1 = clone(self.regressor); reg0 = clone(self.regressor)
+        try: reg1.set_params(n_jobs=-1); reg0.set_params(n_jobs=-1)
+        except: pass
+        reg1.fit(Xb[Tb==1], Yb[Tb==1]) if (Tb==1).any() else None
+        reg0.fit(Xb[Tb==0], Yb[Tb==0]) if (Tb==0).any() else None
+
+        mu1_b = reg1.predict(Xb) if (Tb==1).any() else np.full(len(Xb), Yb.mean())
+        mu0_b = reg0.predict(Xb) if (Tb==0).any() else np.full(len(Xb), Yb.mean())
+
+        m_b = e_b * mu1_b + (1 - e_b) * mu0_b
+        Z_b = ((Tb - e_b) / (e_b * (1 - e_b))) * (Yb - m_b)
+        w_b = e_b * (1 - e_b)
+
+        # —— 训练 tau head —— #
+        tau_params = self.tau_head.copy()
+        tau_model = xgb.XGBRegressor(**tau_params)
+        tau_model.fit(Xb, Z_b, sample_weight=w_b)
 
         # === 缓存用于 report 的数据与指标（不做全量打分） ===
-        # 1) 重新用当前 classifier 计算全量 OOF e，并确定固定评估带
-        e_oof = self._oof_propensity(X, T, self.classifier, trim=self.trim)
+        # 1) 用当前 classifier 计算全量 OOF e，并确定固定评估带
+        e_oof = self._oof_propensity(X_enc_full, T, self.classifier, trim=self.trim)
         band = (e_oof >= self.nauuc_band[0]) & (e_oof <= self.nauuc_band[1])
         coverage = float(band.mean()); n_band = int(band.sum())
 
-        # 2) 带内 OOF nAUUC + Policy@k
-        fr_kwargs = self.forest_head# {k:v for k,v in self.forest_head.items() if k not in {'categories','random_state','n_jobs'}}
-        nauuc, stats = self._oof_nauuc_on_band(X[band], T[band], Y[band],
-                                               self.regressor, self.classifier, fr_kwargs, trim=self.trim)
+        # 2) 带内 OOF nAUUC + Policy@k（用 DR 流程）
+        nauuc, stats = self._oof_nauuc_on_band(X_enc_full[band], T[band], Y[band],
+                                               self.regressor, self.classifier, tau_params, trim=self.trim)
 
         # 3) 缓存
         self._cache = dict(
-            coverage=coverage,
-            n=n_band,
-            nauuc=nauuc,
-            stats=stats,
-            band=self.nauuc_band
+            coverage=coverage, n=n_band, nauuc=nauuc, stats=stats, band=self.nauuc_band
         )
 
         self._fitted = True
-        self._dr = dr_learner
-        return dr_learner
+        self._dr = DRModel(self, ps_model, reg1, reg0, tau_model, trim=self.trim)
+        return self._dr
 
     # ---------- 报告 ----------
     def report(self):
         """
-        仅在 fit() 之后可调用。返回 (text, metrics_dict)
+        仅在 fit() 之后可调用。返回文本
         """
         assert self._fitted, "请先调用 fit(X, T, Y) 再调用 report()。"
         cov = self._cache.get("coverage", float("nan"))
@@ -337,17 +488,15 @@ class HTETester:
         pol_str = " / ".join([f"{k.split('@')[1]}%={stats.get(k, float('nan')):.2f}" for k in pol_keys])
 
         passed = bool(nauuc >= self.min_nauuc)
-        txt = (f"【HTE 可用性报告】\n"
+        txt = (f"【HTE 可用性报告（XGBoost+DR）】\n"
                f"- 评估带 e∈[{lo:.2f},{hi:.2f}] 覆盖率={cov:.2%}, n={n}\n"
                f"- nAUUC={nauuc:.3f}（阈值≥{self.min_nauuc:.2f}）=> {'✅ 可用' if passed else '❌ 暂不建议用于投放'}\n"
                f"- area_model={stats.get('area_model', float('nan')):.2f}, "
                f"area_oracle={stats.get('area_oracle', float('nan')):.2f}\n"
                f"- Policy@k：{pol_str}")
-
-        # metrics = dict(enabled=True, coverage=cov, nauuc=nauuc, passed=passed, **stats)
         return txt
 
-    # ---------- 取回训练好的 DR 模型（可选便捷方法） ----------
+    # ---------- 取回训练好的 DR 模型 ----------
     def get_model(self):
         assert self._fitted and (self._dr is not None), "请先调用 fit(X, T, Y)。"
         return self._dr
