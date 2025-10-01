@@ -12,6 +12,8 @@ from sklearn.decomposition import PCA
 from feature_engine.discretisation import EqualFrequencyDiscretiser
 from feature_engine.encoding import WoEEncoder
 import category_encoders as ce
+from pandas.api.types import is_numeric_dtype, is_integer_dtype, is_string_dtype, is_categorical_dtype
+
 
 try:
     from autofeat import AutoFeatRegressor
@@ -19,11 +21,12 @@ try:
 except Exception:
     _HAS_AUTOF = False
 
+# === 改动：移除 CatBoost，改用 XGBoost ===
 try:
-    from catboost import CatBoostRegressor, CatBoostClassifier, Pool   # ← 加了 Pool
-    _HAS_CATBOOST = True
+    import xgboost as xgb
+    _HAS_XGB = True
 except Exception:
-    _HAS_CATBOOST = False
+    _HAS_XGB = False
 
 
 class DeepFeatureFactory:
@@ -33,7 +36,7 @@ class DeepFeatureFactory:
     - 数值扩展：AutoFeat（可选）、PolynomialFeatures(二阶)
     - 类别增强：K 折 OOF 目标编码、Count/Freq、可选 WoE
     - 统计组合：GroupBy 聚合回填、log1p、比率、乘除交互、分位分箱
-    - 深层表征：CatBoost 叶子索引（leaf embeddings，可选）
+    - 深层表征：XGBoost 叶子索引（leaf embeddings，可选）  ← 已改为 XGBoost
     - 降维：PCA（可选）
     - 列数约束：当超出 max_total_cols 时，用 DSBAN 主成分裁剪为精确列数
     """
@@ -41,50 +44,74 @@ class DeepFeatureFactory:
     def __init__(
         self,
         # 基础列
-        cat_cols: Sequence[str],
-        num_cols: Sequence[str],
+        cat_cols: Optional[Sequence[str]] = None,
+        num_cols: Optional[Sequence[str]] = None,
         group_keys: Sequence[Sequence[str]] = (),
+
+        # 自动识别超参
+        auto_detect_cols: bool = True,
+        int_as_cat_unique_thresh: int = 30,     # 整数型列若唯一值 <= 该阈值 → 视为类别
+        unique_ratio_thresh: float = 0.05,      # 唯一率阈值（nunique/rows <= 阈值 → 倾向类别）
+        high_card_topk: int = 500,              # 高基数 Top-K 保留
+        min_freq_ratio: float = 0.001,          # 稀有类别并桶阈值（按占比）
+
         # OOF target encoding
         enable_target_encoding: bool = True,
         te_smoothing: float = 20.0,
         n_splits: int = 5,
         random_state: int = 42,
+
         # 频数编码 & WoE
         enable_count_freq: bool = True,
         enable_woe: bool = False,   # 二分类时可用
+
         # GroupBy 统计
         enable_groupby_agg: bool = True,
         agg_funcs: Sequence[str] = ("mean", "median", "std", "count", "nunique"),
+
         # 数值派生
         add_log1p: bool = True,
         add_ratios: bool = True,
         add_interactions: bool = True,
         max_interactions: int = 40,
         quantile_bins: int = 10,     # 0 关闭
+
         # 多项式/AutoFeat
         add_poly2: bool = True,
         autofeat_steps: int = 0,     # >0 开启 AutoFeat（开销较大，建议 1~2）
+
         # 叶子嵌入 & PCA
         add_leaf_embeddings: bool = True,
         leaf_task: Optional[str] = None,  # "reg"|"clf"|None 自动
         leaf_rounds: int = 500,
         leaf_depth: int = 6,
         leaf_lr: float = 0.05,
-        leaf_lf: str = "RMSE",  # 仅回归可选
+        leaf_lf: str = "RMSE",  # 兼容旧参数，无实际使用（XGB不需要）
         add_pca: int = 0,            # >0 输出 PC 数量
         scale_before_pca: bool = True,
+
         # 产出控制
         max_total_cols: Optional[int] = None,
+
         # DSBAN 主成分设置（当触发 max_total_cols 限制时）
         dsban_alpha: float = 0.7,        # 监督权重：相关性(α) vs. 方差(1-α)
         dsban_anchor_frac: float = 0.2,  # 锚特征占比
         dsban_min_anchors: int = 20,     # 最少锚数量
         dsban_whiten: bool = False,      # 是否 whiten（仍会先按 scale_before_pca 标准化）
+
+        # XGBoost/GPU 开关（新增）
+        use_gpu: bool = False,
+
         # 日志
         verbose: Union[int, bool] = 1
     ):
-        self.cat_cols = list(cat_cols)
-        self.num_cols = list(num_cols)
+        self.cat_cols = list(cat_cols) if cat_cols is not None else None
+        self.num_cols = list(num_cols) if num_cols is not None else None
+        self.auto_detect_cols = bool(auto_detect_cols)
+        self.int_as_cat_unique_thresh = int(int_as_cat_unique_thresh)
+        self.unique_ratio_thresh = float(unique_ratio_thresh)
+        self.high_card_topk = int(high_card_topk)
+        self.min_freq_ratio = float(min_freq_ratio)
         self.group_keys = [list(g) for g in group_keys]
 
         self.enable_target_encoding = enable_target_encoding
@@ -125,13 +152,19 @@ class DeepFeatureFactory:
         self.dsban_min_anchors = int(max(1, dsban_min_anchors))
         self.dsban_whiten = bool(dsban_whiten)
 
+        # XGB/GPU
+        self.use_gpu = bool(use_gpu)
+
         # 状态
         self._is_binary_target: Optional[bool] = None
         self._global_mean: Optional[float] = None
         self._te_maps: Dict[str, Dict[Any, float]] = {}
         self._qbin_models: Dict[str, EqualFrequencyDiscretiser] = {}
         self._woe_enc: Optional[WoEEncoder] = None
-        self._leaf_model: Optional[Union[CatBoostRegressor, CatBoostClassifier]] = None
+
+        # === 改动：用 XGBoost 模型保存（替代 CatBoost） ===
+        self._leaf_model: Optional[Union["xgb.XGBRegressor", "xgb.XGBClassifier"]] = None
+
         self._scaler: Optional[StandardScaler] = None
         self._pca: Optional[PCA] = None
         self._autofeat_model: Optional[AutoFeatRegressor] = None
@@ -174,6 +207,56 @@ class DeepFeatureFactory:
         for c in cols:
             if c in df:
                 df[c] = df[c].astype("string").fillna("__NA__")
+
+    def _auto_infer_cols(self, df: pd.DataFrame) -> Tuple[List[str], List[str]]:
+        n = len(df)
+        cat_cols, num_cols = [], []
+
+        for c in df.columns:
+            s = df[c]
+            # 先跳过显然不作为特征的 id/time 等（可按需要扩展）
+            if s.dtype.kind == 'M':  # datetime
+                continue
+
+            nunq = s.nunique(dropna=False)
+            unique_ratio = nunq / max(n, 1)
+
+            is_cat_like = (
+                is_string_dtype(s) or
+                is_categorical_dtype(s) or
+                (is_integer_dtype(s) and nunq <= self.int_as_cat_unique_thresh) or
+                (unique_ratio <= self.unique_ratio_thresh and not is_numeric_dtype(s))
+            )
+
+            # 再补一条：有些 int/float 其实是枚举编码（0/1/2…），可按阈值判为类别
+            if not is_cat_like and is_numeric_dtype(s) and nunq <= self.int_as_cat_unique_thresh:
+                is_cat_like = True
+
+            if is_cat_like:
+                cat_cols.append(c)
+            elif is_numeric_dtype(s):
+                num_cols.append(c)
+            # 其它类型（如全空、复杂对象）直接忽略
+
+        return cat_cols, num_cols
+
+    def _cap_high_card_and_rare(self, df: pd.DataFrame, cols: Sequence[str]) -> pd.DataFrame:
+        """对高基数列做 Top-K 保留与稀有类别并桶"""
+        out = df.copy()
+        n = len(out)
+        for c in cols:
+            vc = out[c].value_counts(dropna=False)
+            # 并桶稀有类别
+            rare_thresh = max(int(self.min_freq_ratio * n), 1)
+            rare_values = set(vc[vc < rare_thresh].index.tolist())
+            if rare_values:
+                out[c] = out[c].apply(lambda x: "__RARE__" if x in rare_values else x)
+
+            # 只保留 Top-K（如果超大）
+            if self.high_card_topk and len(vc) > self.high_card_topk:
+                topk = set(vc.index[:self.high_card_topk].tolist())
+                out[c] = out[c].apply(lambda x: x if x in topk else "__RARE__")
+        return out
 
     # ---------------- encodings ---------------- #
     def _oof_target_encode(self, X_cat: pd.DataFrame, y: np.ndarray) -> pd.DataFrame:
@@ -376,60 +459,76 @@ class DeepFeatureFactory:
         Z.columns = [f"autofeat_{i}" for i in range(Z.shape[1])]
         return Z
 
-    # ---------------- leaf embeddings & PCA ---------------- #
+    # ---------------- leaf embeddings (XGBoost) & PCA ---------------- #
+    def _xgb_leaf_model_params(self, task: str) -> Dict[str, Any]:
+        """根据任务类型返回 XGB 的基础参数（支持 GPU 开关）"""
+        if task == "clf":
+            base = dict(
+                objective="binary:logistic",
+                eval_metric="logloss",
+            )
+            ModelCls = xgb.XGBClassifier
+        else:
+            base = dict(
+                objective="reg:squarederror",
+            )
+            ModelCls = xgb.XGBRegressor
+        base.update(dict(
+            n_estimators=self.leaf_rounds,
+            max_depth=self.leaf_depth,
+            learning_rate=self.leaf_lr,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            reg_lambda=1.0,
+            n_jobs=-1,
+            random_state=self.random_state,
+        ))
+        # GPU
+        if self.use_gpu:
+            base.update(dict(tree_method="gpu_hist", predictor="gpu_predictor"))
+        else:
+            base.update(dict(tree_method="hist"))
+        return ModelCls, base
+
     def _fit_leaf_model(self, feat: pd.DataFrame, y: np.ndarray):
-        if not self.add_leaf_embeddings or not _HAS_CATBOOST:
+        """使用 XGBoost 拟合并返回 leaf index 矩阵（n_samples × n_trees）"""
+        if (not self.add_leaf_embeddings) or (not _HAS_XGB):
             return None
         t0 = time.time()
         task = self.leaf_task or ("clf" if self._detect_binary(y) else "reg")
-        self._log(f"[LEAF] Fit CatBoost ({task}) rounds={self.leaf_rounds}, depth={self.leaf_depth} …", 1)
-        Xcb = feat.select_dtypes(include=[np.number]).fillna(0.0).values
-        params = dict(iterations=self.leaf_rounds, depth=self.leaf_depth,
-                      learning_rate=self.leaf_lr, random_seed=self.random_state, verbose=False)
-        if task == "clf":
-            model = CatBoostClassifier(loss_function=self.leaf_lf, **params)
-        else:
-            model = CatBoostRegressor(loss_function=self.leaf_lf, **params)
-        model.fit(Xcb, y)
+        self._log(f"[LEAF-XGB] Fit XGBoost ({task}) rounds={self.leaf_rounds}, depth={self.leaf_depth} …", 1)
+        Xn = feat.select_dtypes(include=[np.number]).fillna(0.0).values
+
+        ModelCls, params = self._xgb_leaf_model_params(task)
+        model = ModelCls(**params)
+        model.fit(Xn, y, verbose=False)
         self._leaf_model = model
+
+        # 利用 apply 获得每棵树的叶子索引（返回 shape: [n_samples, n_trees]）
         try:
-            # 优先：calc_leaf_indexes（更通用稳定）
-            pool = Pool(Xcb)
-            leaf_idx = model.calc_leaf_indexes(pool)
-            leaf_idx = np.array(leaf_idx)
-            if leaf_idx.ndim == 1: leaf_idx = leaf_idx.reshape(-1, 1)
-            self._log(f"[LEAF] Done in {self._elapsed(t0)} | trees={leaf_idx.shape[1] if leaf_idx.ndim==2 else 1}", 1)
+            leaf_idx = model.apply(Xn)
+            leaf_idx = np.asarray(leaf_idx)
+            if leaf_idx.ndim == 1:
+                leaf_idx = leaf_idx.reshape(-1, 1)
+            self._log(f"[LEAF-XGB] Done in {self._elapsed(t0)} | trees={leaf_idx.shape[1]}", 1)
             return leaf_idx
-        except Exception as e1:
-            # 备选回退
-            try:
-                leaf_idx = model.predict(Xcb, prediction_type="LeafIndex")
-                leaf_idx = np.array(leaf_idx)
-                if leaf_idx.ndim == 1: leaf_idx = leaf_idx.reshape(-1, 1)
-                self._log(f"[LEAF] Done (fallback) in {self._elapsed(t0)} | trees={leaf_idx.shape[1] if leaf_idx.ndim==2 else 1}", 1)
-                return leaf_idx
-            except Exception as e2:
-                self._log(f"[LEAF] WARN: cannot extract leaf indexes: {e1} | {e2}", 1)
-                return None
+        except Exception as e:
+            self._log(f"[LEAF-XGB] WARN: cannot extract leaf indexes via apply(): {e}", 1)
+            return None
 
     def _leaf_features(self, feat: pd.DataFrame):
-        if self._leaf_model is None or not _HAS_CATBOOST:
+        """用已拟合的 XGB 模型在新样本上生成 leaf index"""
+        if (self._leaf_model is None) or (not _HAS_XGB):
             return None
-        Xcb = feat.select_dtypes(include=[np.number]).fillna(0.0).values
+        Xn = feat.select_dtypes(include=[np.number]).fillna(0.0).values
         try:
-            pool = Pool(Xcb)
-            leaf_idx = self._leaf_model.calc_leaf_indexes(pool)
-            leaf_idx = np.array(leaf_idx)
-            if leaf_idx.ndim == 1: leaf_idx = leaf_idx.reshape(-1, 1)
+            leaf_idx = self._leaf_model.apply(Xn)
+            leaf_idx = np.asarray(leaf_idx)
+            if leaf_idx.ndim == 1:
+                leaf_idx = leaf_idx.reshape(-1, 1)
             return leaf_idx
         except Exception:
-            try:
-                leaf_idx = self._leaf_model.predict(Xcb, prediction_type="LeafIndex")
-                leaf_idx = np.array(leaf_idx)
-                if leaf_idx.ndim == 1: leaf_idx = leaf_idx.reshape(-1, 1)
-                return leaf_idx
-            except Exception:
-                return None
+            return None
 
     def _fit_pca(self, feat_num: np.ndarray):
         if self.add_pca <= 0:
@@ -525,7 +624,6 @@ class DeepFeatureFactory:
         if self._dsban_scaler is not None:
             Xa = self._dsban_scaler.transform(Xa)
         comps = self._dsban_pca.transform(Xa)
-        # 截断/填充到 k_out（一般不需要，组件数在 fit 时定死了）
         comps = comps[:, :min(k_out, comps.shape[1])]
         out = pd.DataFrame(comps, index=feat.index, columns=[f"dsban_pc_{i+1}" for i in range(comps.shape[1])])
         return out
@@ -533,11 +631,23 @@ class DeepFeatureFactory:
     # ---------------- Public API ---------------- #
     def fit_transform(self, df: pd.DataFrame, y: Optional[np.ndarray] = None) -> pd.DataFrame:
         t0 = time.time()
-        self._log(f"[FDF] fit_transform start | rows={len(df)}, cat={len(self.cat_cols)}, num={len(self.num_cols)}", 1)
 
         X = df.copy()
-        self._to_category(X, self.cat_cols)
+        # 若需要自动识别
+        if self.auto_detect_cols and (self.cat_cols is None or self.num_cols is None):
+            cat_auto, num_auto = self._auto_infer_cols(X)
+            if self.cat_cols is None: self.cat_cols = cat_auto
+            if self.num_cols is None: self.num_cols = num_auto
+            self._log(f"[AUTO] cat_cols={len(self.cat_cols)}, num_cols={len(self.num_cols)}", 1)
 
+        # 兜底：防止仍为 None
+        if self.cat_cols is None: self.cat_cols = []
+        if self.num_cols is None: self.num_cols = []
+
+        # 统一转为 string，并做高基数/稀有并桶
+        self._to_category(X, self.cat_cols)
+        if self.cat_cols:
+            X[self.cat_cols] = self._cap_high_card_and_rare(X[self.cat_cols],self.cat_cols)
         # enc/agg
         te_df = self._oof_target_encode(X[self.cat_cols], y) if (y is not None and self.enable_target_encoding) else pd.DataFrame(index=X.index)
         cf_df = self._count_freq(X)
@@ -560,7 +670,7 @@ class DeepFeatureFactory:
             feat = pd.concat([feat, af_df], axis=1)
             self._log(f"[FDF] add AutoFeat {self._delta_cols(before, feat.shape[1])} | shape={feat.shape}", 1)
 
-        # leaf embeddings
+        # leaf embeddings (XGBoost)
         if (y is not None) and self.add_leaf_embeddings:
             before = feat.shape[1]
             leaf_idx = self._fit_leaf_model(feat, y)
@@ -578,11 +688,10 @@ class DeepFeatureFactory:
                 feat[f"pca_{i+1}"] = comps[:, i]
         self._log(f"[FDF] add PCA {self._delta_cols(before, feat.shape[1])} | shape={feat.shape}", 1)
 
-        # —— 核心修改：若超出上限，启用 DSBAN 主成分裁剪 ——
+        # —— 若超出上限，启用 DSBAN 主成分裁剪 ——
         if self.max_total_cols is not None and feat.shape[1] > self.max_total_cols:
             self._log(f"[FDF] exceed max_total_cols={self.max_total_cols} → use DSBAN PCs", 1)
             dsban_df = self._fit_dsban(feat, y, k_out=self.max_total_cols)
-            # 用 DSBANPC 直接替代整体特征（保证列数精确）
             feat = dsban_df
             self._log(f"[FDF] after DSBAN | shape={feat.shape}", 1)
 
@@ -596,7 +705,21 @@ class DeepFeatureFactory:
         self._log(f"[FDF] transform start | rows={len(df)}", 1)
 
         X = df.copy()
+        # 若需要自动识别
+        if self.auto_detect_cols and (self.cat_cols is None or self.num_cols is None):
+            cat_auto, num_auto = self._auto_infer_cols(X)
+            if self.cat_cols is None: self.cat_cols = cat_auto
+            if self.num_cols is None: self.num_cols = num_auto
+            self._log(f"[AUTO] cat_cols={len(self.cat_cols)}, num_cols={len(self.num_cols)}", 1)
+
+        # 兜底：防止仍为 None
+        if self.cat_cols is None: self.cat_cols = []
+        if self.num_cols is None: self.num_cols = []
+
+        # 统一转为 string，并做高基数/稀有并桶
         self._to_category(X, self.cat_cols)
+        if self.cat_cols:
+            X[self.cat_cols] = self._cap_high_card_and_rare(X[self.cat_cols],self.cat_cols)
 
         te_df = pd.DataFrame(index=X.index)
         if self.enable_target_encoding and self._te_maps:
@@ -622,6 +745,7 @@ class DeepFeatureFactory:
             feat = pd.concat([feat, af_df], axis=1)
             self._log(f"[FDF] add AutoFeat | shape={feat.shape}", 1)
 
+        # 叶子索引（推理）
         leaf_idx = self._leaf_features(feat)
         if leaf_idx is not None:
             for i in range(leaf_idx.shape[1]):
@@ -644,3 +768,46 @@ class DeepFeatureFactory:
 
         self._log(f"[FDF] transform done in {self._elapsed(t0)} | final shape={feat.shape}", 1)
         return feat
+
+if __name__ == "__main__":
+    from causaldata import nhefs_complete
+    try:
+        df = nhefs_complete.load_pandas().data.copy()
+    except Exception:
+        df = nhefs_complete.load_pandas().copy()
+
+    t_col = "qsmk"
+    y_col = "wt82_71"
+
+    base_covs = [
+        "sex", "race", "age", "education",
+        "smokeintensity", "smokeyrs",
+        "exercise", "active",
+        "wt71", "ht", "bmix",
+        "alcohol", "marital"
+    ]
+    covs = [c for c in base_covs if c in df.columns]
+    if "bmi" in df.columns and "bmix" not in df.columns:
+        covs.append("bmi")
+
+    # 清洗：只保留需要列，并去掉 y 缺失
+    use_cols = covs + [y_col]
+    df_use = df[use_cols].dropna(subset=[y_col]).copy()
+
+    dff = DeepFeatureFactory(
+        cat_cols=None,
+        num_cols=None,
+        auto_detect_cols=True,
+        int_as_cat_unique_thresh=30,
+        unique_ratio_thresh=0.05,
+        high_card_topk=500,
+        min_freq_ratio=0.001,
+        use_gpu=False,          # 本地无GPU时置 False
+        max_total_cols=300,
+        add_leaf_embeddings=True,
+        verbose=1
+    )
+
+    # 注意：传入目标“数组”，不是列名字符串
+    feat_train = dff.fit_transform(df_use[covs], y=df_use[y_col].values)
+    print("feat_train shape:", feat_train.shape)
