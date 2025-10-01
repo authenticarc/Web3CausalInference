@@ -500,3 +500,64 @@ class HTETester:
     def get_model(self):
         assert self._fitted and (self._dr is not None), "请先调用 fit(X, T, Y)。"
         return self._dr
+    
+    # === 新增：从外部承接编码映射（可选）===
+    def adopt_encoder(self, cat_levels: dict, colnames: list):
+        """把外部调参器/编码器学到的类别映射与列顺序塞进来，后续 effect(X) 会与外部一致"""
+        self._cat_levels_ = {k: list(v) for k, v in cat_levels.items()}
+        self._colnames_ = list(colnames)
+
+    # === 新增：免训练入口（复用已拟合好的模型）===
+    def fit_prefit(self, X, T, Y,
+                   prefit_ps, prefit_m1, prefit_m0, prefit_tau=None,
+                   band=None):
+        """
+        X: 原始 DataFrame/ndarray（若想复用外部编码，请先调用 adopt_encoder(...)）
+        prefit_ps / prefit_m1 / prefit_m0 / prefit_tau: 已经 fit 好的 sklearn/xgboost 模型
+        band: 可选布尔掩码（不提供则按 PS 的 e(x) 和 nauuc_band 自动生成）
+        """
+        # 如果还没编码映射，先在本数据上拟合一个（与外部不完全一致，但能自洽）
+        X_enc_full = self._encode_X_fit(X) if self._colnames_ is None else self._encode_X(X)
+        T = np.asarray(T, int); Y = np.asarray(Y, float)
+
+        # —— 直接拿 prefit 的模型打分 —— #
+        e_full = np.clip(prefit_ps.predict_proba(X_enc_full)[:, 1], self.trim, 1 - self.trim)
+        mu1_full = prefit_m1.predict(X_enc_full)
+        mu0_full = prefit_m0.predict(X_enc_full)
+
+        # 评估带
+        if band is None:
+            lo, hi = self.nauuc_band
+            band = (e_full >= lo) & (e_full <= hi)
+
+        # tau 的打分：优先用 prefit_tau，否则回退 m1 - m0
+        if prefit_tau is not None:
+            tau_full = prefit_tau.predict(X_enc_full)
+        else:
+            tau_full = mu1_full - mu0_full  # 回退为 T-learner 排序分
+
+        # === 缓存报告指标（不训练）===
+        psi = _aipw_pseudo(Y[band], T[band], mu1_full[band], mu0_full[band], e_full[band], trim=self.trim)
+        tau_b = tau_full[band]
+
+        # nAUUC（中心化累积增益）
+        area_model  = _area_cumgain_centered(psi, tau_b)
+        area_oracle = _area_cumgain_centered(psi, psi)
+        nauuc = float(np.clip(area_model/area_oracle, 0.0, 1.0)) if abs(area_oracle) > 1e-12 else 0.0
+        pol = _policy_values(psi, tau_b, ks=self.nauuc_policy_ks)
+
+        self._cache = dict(
+            coverage=float(band.mean()),
+            n=int(band.sum()),
+            nauuc=nauuc,
+            stats=dict(area_model=area_model, area_oracle=area_oracle, **pol),
+            band=self.nauuc_band
+        )
+
+        # —— 包装成 DRModel（effect/propensity/mu_hat 可直接用）—— #
+        self._dr = DRModel(self, prefit_ps, prefit_m1, prefit_m0,
+                           prefit_tau if prefit_tau is not None else _TauWrapperFromM10(prefit_m1, prefit_m0, self),
+                           trim=self.trim)
+        self._fitted = True
+        return self._dr
+
