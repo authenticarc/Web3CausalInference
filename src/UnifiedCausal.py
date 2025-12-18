@@ -8,6 +8,7 @@ from catboost import CatBoostClassifier, CatBoostRegressor
 from joblib import Parallel, delayed
 from tqdm.auto import tqdm
 from econml.dr import ForestDRLearner   # ← 新增：用于 τ̂_oof
+from catboost import CatBoostError
 
 # 尝试使用 tqdm_joblib（可选）
 try:
@@ -101,12 +102,40 @@ class CausalRules:
     top_k_smd: int = 10
 
 # ===== 单折函数（供并行）=====
+# def _fit_fold_return_oof(va_idx, X_tr, X_va, T_tr, Y_tr,
+#                          regressor_proto, classifier_proto, trim, seed):
+#     clf = clone(classifier_proto)
+#     reg1 = clone(regressor_proto)
+#     reg0 = clone(regressor_proto)
+#     # 外层并行 → 内层单线程
+#     for mdl in (clf, reg1, reg0):
+#         if hasattr(mdl, "set_params"):
+#             try: mdl.set_params(thread_count=1)
+#             except: pass
+
+#     try:
+#         clf.fit(X_tr, T_tr)
+#         e_hat = np.clip(clf.predict_proba(X_va)[:, 1], trim, 1 - trim)
+
+#         mu1_hat = np.zeros(len(va_idx))
+#         mu0_hat = np.zeros(len(va_idx))
+#         if (T_tr==1).any():
+#             reg1.fit(X_tr[T_tr==1], Y_tr[T_tr==1])
+#             mu1_hat = reg1.predict(X_va)
+#         if (T_tr==0).any():
+#             reg0.fit(X_tr[T_tr==0], Y_tr[T_tr==0])
+#             mu0_hat = reg0.predict(X_va)
+
+#         return va_idx, mu1_hat, mu0_hat, e_hat
+#     except:
+#         return None, None, None, None
+
 def _fit_fold_return_oof(va_idx, X_tr, X_va, T_tr, Y_tr,
                          regressor_proto, classifier_proto, trim, seed):
     clf = clone(classifier_proto)
     reg1 = clone(regressor_proto)
     reg0 = clone(regressor_proto)
-    # 外层并行 → 内层单线程
+
     for mdl in (clf, reg1, reg0):
         if hasattr(mdl, "set_params"):
             try: mdl.set_params(thread_count=1)
@@ -115,14 +144,31 @@ def _fit_fold_return_oof(va_idx, X_tr, X_va, T_tr, Y_tr,
     clf.fit(X_tr, T_tr)
     e_hat = np.clip(clf.predict_proba(X_va)[:, 1], trim, 1 - trim)
 
-    mu1_hat = np.zeros(len(va_idx))
-    mu0_hat = np.zeros(len(va_idx))
-    if (T_tr==1).any():
-        reg1.fit(X_tr[T_tr==1], Y_tr[T_tr==1])
-        mu1_hat = reg1.predict(X_va)
-    if (T_tr==0).any():
-        reg0.fit(X_tr[T_tr==0], Y_tr[T_tr==0])
-        mu0_hat = reg0.predict(X_va)
+    n_va = len(va_idx)
+    mu1_hat = np.zeros(n_va, dtype=float)
+    mu0_hat = np.zeros(n_va, dtype=float)
+
+    if (T_tr == 1).any():
+        y1 = Y_tr[T_tr == 1]
+        if np.ptp(y1) < 1e-12:
+            mu1_hat[:] = float(y1[0])
+        else:
+            try:
+                reg1.fit(X_tr[T_tr == 1], y1)
+                mu1_hat = reg1.predict(X_va)
+            except CatBoostError:
+                mu1_hat[:] = float(np.mean(y1))
+
+    if (T_tr == 0).any():
+        y0 = Y_tr[T_tr == 0]
+        if np.ptp(y0) < 1e-12:
+            mu0_hat[:] = float(y0[0])
+        else:
+            try:
+                reg0.fit(X_tr[T_tr == 0], y0)
+                mu0_hat = reg0.predict(X_va)
+            except CatBoostError:
+                mu0_hat[:] = float(np.mean(y0))
 
     return va_idx, mu1_hat, mu0_hat, e_hat
 
@@ -218,7 +264,8 @@ class UnifiedCausalTester:
                 results = Parallel(n_jobs=self.n_jobs, backend="loky", verbose=0)(tasks)
 
             for (va_idx, mu1_hat, mu0_hat, e_hat) in results:
-                mu1_oof[va_idx] = mu1_hat; mu0_oof[va_idx] = mu0_hat; e_oof[va_idx] = e_hat
+                if va_idx is not None:
+                    mu1_oof[va_idx] = mu1_hat; mu0_oof[va_idx] = mu0_hat; e_oof[va_idx] = e_hat
 
         return mu1_oof, mu0_oof, e_oof
 

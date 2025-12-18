@@ -1,3 +1,4 @@
+
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 import time
@@ -20,7 +21,7 @@ except Exception:
     _HAS_AUTOF = False
 
 try:
-    from catboost import CatBoostRegressor, CatBoostClassifier, Pool   # ← 加了 Pool
+    from catboost import CatBoostRegressor, CatBoostClassifier, Pool
     _HAS_CATBOOST = True
 except Exception:
     _HAS_CATBOOST = False
@@ -146,6 +147,11 @@ class DeepFeatureFactory:
         # 日志
         self.verbose = int(verbose)
 
+        # ---------- 内存控制参数（不暴露在 API，上层不用管） ----------
+        self._large_row_threshold = 200_000    # 超过认为是大样本，触发轻量模式
+        self._pca_fit_samples = 100_000        # PCA 拟合用的行数上限（随机抽样）
+        self._pca_batch_size = 50_000          # PCA transform 的 batch size
+
     # ---------------- logging utils ---------------- #
     def _log(self, msg: str, level: int = 1):
         if self.verbose >= level:
@@ -264,21 +270,27 @@ class DeepFeatureFactory:
         out = pd.DataFrame(index=X.index)
         for keys in self.group_keys:
             keyname = "__".join(keys)
-            g = X.groupby(keys, dropna=False)
+            g = X.groupby(keys, dropna=False, observed=True)
             for num in self.num_cols:
-                if num not in X: continue
+                if num not in X:
+                    continue
+                agg_df = g[num].agg(list(self.agg_funcs))
+                agg_df.columns = list(self.agg_funcs)
+                merged = X[keys].merge(
+                    agg_df.reset_index(),
+                    on=keys,
+                    how="left"
+                )
                 for f in self.agg_funcs:
                     col = f"grp_{keyname}__{num}__{f}"
-                    out[col] = X[keys].merge(
-                        g[num].agg(f).rename("val"),
-                        left_on=keys, right_index=True, how="left"
-                    )["val"].values
+                    out[col] = merged[f].values
         self._log(f"[GRP] Done in {self._elapsed(t0)} | out_cols={out.shape[1]}", 1)
         return out
 
     def _numeric_derivatives(self, X: pd.DataFrame) -> pd.DataFrame:
         t0 = time.time()
-        self._log(f"[NUM] Start numeric derivatives …", 1)
+        n_rows = len(X)
+        self._log(f"[NUM] Start numeric derivatives … (rows={n_rows})", 1)
         out = pd.DataFrame(index=X.index)
         nums = [c for c in self.num_cols if c in X]
 
@@ -292,13 +304,24 @@ class DeepFeatureFactory:
             denom_like = [c for c in nums if any(s in c.lower() for s in ["cnt", "count", "num", "hour", "day", "n_"])]
             numer_like = [c for c in nums if c not in denom_like]
             made = 0
+            # 大样本时减少 ratio 特征数量
+            ratio_limit = 60
+            if n_rows > self._large_row_threshold:
+                ratio_limit = 20
+                self._log(f"[NUM]  large rows={n_rows}: cap ratio features to {ratio_limit}", 2)
             for a in numer_like:
                 for b in denom_like:
-                    if a == b: continue
-                    out[f"ratio__{a}__per__{b}"] = self._safe_div(pd.to_numeric(X[a], errors="coerce"),
-                                                                  pd.to_numeric(X[b], errors="coerce"))
+                    if a == b:
+                        continue
+                    out[f"ratio__{a}__per__{b}"] = self._safe_div(
+                        pd.to_numeric(X[a], errors="coerce"),
+                        pd.to_numeric(X[b], errors="coerce")
+                    )
                     made += 1
-                    if made >= 60: break
+                    if made >= ratio_limit:
+                        break
+                if made >= ratio_limit:
+                    break
         self._log(f"[NUM]  ratios {self._delta_cols(before, out.shape[1])}", 2); before = out.shape[1]
 
         if self.add_interactions and len(nums) >= 2:
@@ -309,25 +332,33 @@ class DeepFeatureFactory:
                 for j in range(i+1, len(base)):
                     pairs.append((base[i], base[j]))
             rng.shuffle(pairs)
-            for k, (a, b) in enumerate(pairs[: self.max_interactions]):
+            max_inter = self.max_interactions
+            if n_rows > self._large_row_threshold:
+                max_inter = min(self.max_interactions, 10)
+                self._log(f"[NUM]  large rows={n_rows}: cap interactions to {max_inter}", 2)
+            for k, (a, b) in enumerate(pairs[: max_inter]):
                 A = pd.to_numeric(X[a], errors="coerce")
                 B = pd.to_numeric(X[b], errors="coerce")
                 out[f"inter__{a}__x__{b}"] = A * B
                 out[f"inter__{a}__div__{b}"] = self._safe_div(A, B)
         self._log(f"[NUM]  interactions {self._delta_cols(before, out.shape[1])}", 2); before = out.shape[1]
 
-        if self.quantile_bins and self.quantile_bins > 1:
-            for c in nums:
-                try:
-                    disc = EqualFrequencyDiscretiser(q=self.quantile_bins, variables=[c], return_object=True)
-                    disc.fit(X[[c]])
-                    qb = disc.transform(X[[c]])
-                    dummies = pd.get_dummies(qb[c], prefix=f"{c}__qbin", dummy_na=True)
-                    keep = [col for col in dummies.columns][: min(6, dummies.shape[1])]
-                    out = pd.concat([out, dummies[keep]], axis=1)
-                    self._qbin_models[c] = disc
-                except Exception:
-                    pass
+        if self.quantile_bins and self.quantile_bins > 1 and len(nums) > 0:
+            if n_rows > self._large_row_threshold:
+                # 大样本直接跳过 qbin，避免 get_dummies 爆内存
+                self._log(f"[NUM]  skip qbins for large rows={n_rows} to save memory", 2)
+            else:
+                for c in nums:
+                    try:
+                        disc = EqualFrequencyDiscretiser(q=self.quantile_bins, variables=[c], return_object=True)
+                        disc.fit(X[[c]])
+                        qb = disc.transform(X[[c]])
+                        dummies = pd.get_dummies(qb[c], prefix=f"{c}__qbin", dummy_na=True)
+                        keep = [col for col in dummies.columns][: min(6, dummies.shape[1])]
+                        out = pd.concat([out, dummies[keep]], axis=1)
+                        self._qbin_models[c] = disc
+                    except Exception:
+                        pass
         self._log(f"[NUM]  qbins {self._delta_cols(before, out.shape[1])}", 2)
 
         self._log(f"[NUM] Done in {self._elapsed(t0)} | out_cols={out.shape[1]}", 1)
@@ -337,11 +368,18 @@ class DeepFeatureFactory:
     def _fit_poly2(self, feat: pd.DataFrame) -> pd.DataFrame:
         if not self.add_poly2:
             return pd.DataFrame(index=feat.index)
+        n_rows, n_cols = feat.shape
+        # 大样本或特征数太多时直接跳过 poly，防止 OOM
+        if n_rows > self._large_row_threshold or n_cols > 150:
+            self._log(f"[POLY] Skip PolynomialFeatures for large data (rows={n_rows}, cols={n_cols})", 1)
+            self._poly = None
+            return pd.DataFrame(index=feat.index)
+
         t0 = time.time()
         self._log("[POLY] Fit PolynomialFeatures(degree=2)…", 1)
-        Xn = feat.select_dtypes(include=[np.number]).fillna(0.0).values
+        Xn = feat.select_dtypes(include=[np.number]).fillna(0.0).astype(np.float32).values
         self._poly = PolynomialFeatures(degree=2, include_bias=False)
-        Z = self._poly.fit_transform(Xn)
+        Z = self._poly.fit_transform(Xn).astype(np.float32)
         cols = [f"poly2_{i}" for i in range(Z.shape[1])]
         out = pd.DataFrame(Z, index=feat.index, columns=cols)
         self._log(f"[POLY] Done in {self._elapsed(t0)} | out_cols={out.shape[1]}", 1)
@@ -350,8 +388,8 @@ class DeepFeatureFactory:
     def _poly2_transform(self, feat: pd.DataFrame) -> pd.DataFrame:
         if self._poly is None:
             return pd.DataFrame(index=feat.index)
-        Xn = feat.select_dtypes(include=[np.number]).fillna(0.0).values
-        Z = self._poly.transform(Xn)
+        Xn = feat.select_dtypes(include=[np.number]).fillna(0.0).astype(np.float32).values
+        Z = self._poly.transform(Xn).astype(np.float32)
         cols = [f"poly2_{i}" for i in range(Z.shape[1])]
         return pd.DataFrame(Z, index=feat.index, columns=cols)
 
@@ -383,7 +421,7 @@ class DeepFeatureFactory:
         t0 = time.time()
         task = self.leaf_task or ("clf" if self._detect_binary(y) else "reg")
         self._log(f"[LEAF] Fit CatBoost ({task}) rounds={self.leaf_rounds}, depth={self.leaf_depth} …", 1)
-        Xcb = feat.select_dtypes(include=[np.number]).fillna(0.0).values
+        Xcb = feat.select_dtypes(include=[np.number]).fillna(0.0).astype(np.float32).values
         params = dict(iterations=self.leaf_rounds, depth=self.leaf_depth,
                       learning_rate=self.leaf_lr, random_seed=self.random_state, verbose=False)
         if task == "clf":
@@ -392,20 +430,22 @@ class DeepFeatureFactory:
             model = CatBoostRegressor(loss_function=self.leaf_lf, **params)
         model.fit(Xcb, y)
         self._leaf_model = model
+
+        # 为了避免在这里一次性拿全量叶子索引导致 OOM，把真正的 leaf 特征生成推迟到 _leaf_features
         try:
-            # 优先：calc_leaf_indexes（更通用稳定）
             pool = Pool(Xcb)
             leaf_idx = model.calc_leaf_indexes(pool)
             leaf_idx = np.array(leaf_idx)
-            if leaf_idx.ndim == 1: leaf_idx = leaf_idx.reshape(-1, 1)
+            if leaf_idx.ndim == 1:
+                leaf_idx = leaf_idx.reshape(-1, 1)
             self._log(f"[LEAF] Done in {self._elapsed(t0)} | trees={leaf_idx.shape[1] if leaf_idx.ndim==2 else 1}", 1)
             return leaf_idx
         except Exception as e1:
-            # 备选回退
             try:
                 leaf_idx = model.predict(Xcb, prediction_type="LeafIndex")
                 leaf_idx = np.array(leaf_idx)
-                if leaf_idx.ndim == 1: leaf_idx = leaf_idx.reshape(-1, 1)
+                if leaf_idx.ndim == 1:
+                    leaf_idx = leaf_idx.reshape(-1, 1)
                 self._log(f"[LEAF] Done (fallback) in {self._elapsed(t0)} | trees={leaf_idx.shape[1] if leaf_idx.ndim==2 else 1}", 1)
                 return leaf_idx
             except Exception as e2:
@@ -415,43 +455,89 @@ class DeepFeatureFactory:
     def _leaf_features(self, feat: pd.DataFrame):
         if self._leaf_model is None or not _HAS_CATBOOST:
             return None
-        Xcb = feat.select_dtypes(include=[np.number]).fillna(0.0).values
+        Xcb = feat.select_dtypes(include=[np.number]).fillna(0.0).astype(np.float32).values
         try:
             pool = Pool(Xcb)
             leaf_idx = self._leaf_model.calc_leaf_indexes(pool)
             leaf_idx = np.array(leaf_idx)
-            if leaf_idx.ndim == 1: leaf_idx = leaf_idx.reshape(-1, 1)
+            if leaf_idx.ndim == 1:
+                leaf_idx = leaf_idx.reshape(-1, 1)
             return leaf_idx
         except Exception:
             try:
                 leaf_idx = self._leaf_model.predict(Xcb, prediction_type="LeafIndex")
                 leaf_idx = np.array(leaf_idx)
-                if leaf_idx.ndim == 1: leaf_idx = leaf_idx.reshape(-1, 1)
+                if leaf_idx.ndim == 1:
+                    leaf_idx = leaf_idx.reshape(-1, 1)
                 return leaf_idx
             except Exception:
                 return None
 
-    def _fit_pca(self, feat_num: np.ndarray):
+    def _fit_pca(self, feat_num_df: pd.DataFrame):
         if self.add_pca <= 0:
             return None
         t0 = time.time()
-        self._log(f"[PCA] Fit PCA(n_components={self.add_pca}) …", 1)
-        Z = feat_num
+        n_rows, n_cols = feat_num_df.shape
+        if n_rows == 0 or n_cols == 0:
+            self._log("[PCA] Skip (no numeric features)", 1)
+            return None
+
+        self._log(f"[PCA] Fit PCA(n_components={self.add_pca}) on sample … (rows={n_rows}, cols={n_cols})", 1)
+
+        # 1) 用子样本拟合 scaler + PCA，减少内存占用
+        fit_n = min(self._pca_fit_samples, n_rows)
+        if fit_n < n_rows:
+            rng = np.random.RandomState(self.random_state)
+            idx = rng.choice(n_rows, size=fit_n, replace=False)
+            X_fit = feat_num_df.iloc[idx].to_numpy(dtype=np.float32, copy=False)
+        else:
+            X_fit = feat_num_df.to_numpy(dtype=np.float32, copy=False)
+
+        Z_fit = X_fit
         if self.scale_before_pca:
             self._scaler = StandardScaler()
-            Z = self._scaler.fit_transform(Z)
-        self._pca = PCA(n_components=self.add_pca, random_state=self.random_state)
-        comps = self._pca.fit_transform(Z)
+            Z_fit = self._scaler.fit_transform(Z_fit)
+        else:
+            self._scaler = None
+
+        self._pca = PCA(n_components=min(self.add_pca, n_cols), random_state=self.random_state)
+        self._pca.fit(Z_fit)
+
+        # 2) 对全量数据分 batch transform，避免一次性载入大矩阵
+        batch_size = self._pca_batch_size
+        comps_list = []
+        for start in range(0, n_rows, batch_size):
+            end = min(start + batch_size, n_rows)
+            batch_df = feat_num_df.iloc[start:end]
+            Xb = batch_df.to_numpy(dtype=np.float32, copy=False)
+            if self._scaler is not None:
+                Xb = self._scaler.transform(Xb)
+            Zb = self._pca.transform(Xb).astype(np.float32)
+            comps_list.append(Zb)
+        comps = np.vstack(comps_list)
+
         self._log(f"[PCA] Done in {self._elapsed(t0)}", 1)
         return comps
 
-    def _pca_transform(self, feat_num: np.ndarray):
+    def _pca_transform(self, feat_num_df: pd.DataFrame):
         if self._pca is None:
             return None
-        Z = feat_num
-        if self._scaler is not None:
-            Z = self._scaler.transform(Z)
-        return self._pca.transform(Z)
+        n_rows, _ = feat_num_df.shape
+        if n_rows == 0:
+            return None
+
+        batch_size = self._pca_batch_size
+        comps_list = []
+        for start in range(0, n_rows, batch_size):
+            end = min(start + batch_size, n_rows)
+            batch_df = feat_num_df.iloc[start:end]
+            Xb = batch_df.to_numpy(dtype=np.float32, copy=False)
+            if self._scaler is not None:
+                Xb = self._scaler.transform(Xb)
+            Zb = self._pca.transform(Xb).astype(np.float32)
+            comps_list.append(Zb)
+        comps = np.vstack(comps_list)
+        return comps
 
     # ---------------- DSBAN: 监督式主成分裁剪 ---------------- #
     def _score_features_for_dsban(self, Xnum: np.ndarray, y: Optional[np.ndarray]) -> np.ndarray:
@@ -478,7 +564,7 @@ class DeepFeatureFactory:
         t0 = time.time()
         self._log(f"[DSBAN] Fit supervised PCA to meet max_total_cols={k_out} …", 1)
 
-        Xnum_df = feat.select_dtypes(include=[np.number]).fillna(0.0)
+        Xnum_df = feat.select_dtypes(include=[np.number]).fillna(0.0).astype(np.float32)
         Xnum = Xnum_df.values
         p = Xnum.shape[1]
         if p == 0:
@@ -502,12 +588,12 @@ class DeepFeatureFactory:
             self._dsban_scaler = None
 
         pca = PCA(n_components=min(k_out, Xa.shape[1]), whiten=self.dsban_whiten, random_state=self.random_state)
-        comps = pca.fit_transform(Xa)
+        comps = pca.fit_transform(Xa).astype(np.float32)
         self._dsban_pca = pca
 
         # 3) 命名输出
         cols = [f"dsban_pc_{i+1}" for i in range(comps.shape[1])]
-        out = pd.DataFrame(comps, index=feat.index, columns=[f"dsban_pc_{i+1}" for i in range(comps.shape[1])])
+        out = pd.DataFrame(comps, index=feat.index, columns=cols)
         self._log(f"[DSBAN] Done in {self._elapsed(t0)} | anchors={n_anchor}, pcs={out.shape[1]}", 1)
         return out
 
@@ -516,16 +602,15 @@ class DeepFeatureFactory:
         if self._dsban_anchor_idx is None or self._dsban_pca is None:
             # 未拟合，直接返回空
             return pd.DataFrame(index=feat.index)
-        Xnum_df = feat.select_dtypes(include=[np.number]).fillna(0.0)
+        Xnum_df = feat.select_dtypes(include=[np.number]).fillna(0.0).astype(np.float32)
         if Xnum_df.shape[1] == 0:
-            return pd.DataFrame(index=feat.index)
+            return pd.DataFrame(index=Xnum_df.index)
 
         anchor_idx = self._dsban_anchor_idx
         Xa = Xnum_df.values[:, anchor_idx]
         if self._dsban_scaler is not None:
             Xa = self._dsban_scaler.transform(Xa)
-        comps = self._dsban_pca.transform(Xa)
-        # 截断/填充到 k_out（一般不需要，组件数在 fit 时定死了）
+        comps = self._dsban_pca.transform(Xa).astype(np.float32)
         comps = comps[:, :min(k_out, comps.shape[1])]
         out = pd.DataFrame(comps, index=feat.index, columns=[f"dsban_pc_{i+1}" for i in range(comps.shape[1])])
         return out
@@ -546,6 +631,12 @@ class DeepFeatureFactory:
         num_df = self._numeric_derivatives(X)
 
         feat = pd.concat([X[self.num_cols], te_df, cf_df, woe_df, gb_df, num_df], axis=1)
+
+        # 所有数值列统一 downcast 为 float32，降低一半内存
+        num_cols_feat = feat.select_dtypes(include=[np.number]).columns
+        if len(num_cols_feat) > 0:
+            feat[num_cols_feat] = feat[num_cols_feat].astype(np.float32)
+
         self._log(f"[FDF] after enc/agg | shape={feat.shape}", 1)
 
         # poly & autofeat
@@ -571,18 +662,17 @@ class DeepFeatureFactory:
 
         # PCA（常规无监督 PC，可作为额外补充）
         before = feat.shape[1]
-        num_mat = feat.select_dtypes(include=[np.number]).fillna(0.0).values
-        comps = self._fit_pca(num_mat)
+        num_df_for_pca = feat.select_dtypes(include=[np.number]).fillna(0.0).astype(np.float32)
+        comps = self._fit_pca(num_df_for_pca)
         if comps is not None:
             for i in range(comps.shape[1]):
                 feat[f"pca_{i+1}"] = comps[:, i]
         self._log(f"[FDF] add PCA {self._delta_cols(before, feat.shape[1])} | shape={feat.shape}", 1)
 
-        # —— 核心修改：若超出上限，启用 DSBAN 主成分裁剪 ——
+        # —— 若超出上限，启用 DSBAN 主成分裁剪 ——
         if self.max_total_cols is not None and feat.shape[1] > self.max_total_cols:
             self._log(f"[FDF] exceed max_total_cols={self.max_total_cols} → use DSBAN PCs", 1)
             dsban_df = self._fit_dsban(feat, y, k_out=self.max_total_cols)
-            # 用 DSBANPC 直接替代整体特征（保证列数精确）
             feat = dsban_df
             self._log(f"[FDF] after DSBAN | shape={feat.shape}", 1)
 
@@ -611,6 +701,11 @@ class DeepFeatureFactory:
         num_df = self._numeric_derivatives(X)
 
         feat = pd.concat([X[self.num_cols], te_df, cf_df, woe_df, gb_df, num_df], axis=1)
+
+        num_cols_feat = feat.select_dtypes(include=[np.number]).columns
+        if len(num_cols_feat) > 0:
+            feat[num_cols_feat] = feat[num_cols_feat].astype(np.float32)
+
         self._log(f"[FDF] after enc/agg | shape={feat.shape}", 1)
 
         poly_df = self._poly2_transform(feat)
@@ -628,8 +723,8 @@ class DeepFeatureFactory:
                 feat[f"leaf_idx_{i}"] = leaf_idx[:, i]
             self._log(f"[FDF] add LEAF | shape={feat.shape}", 1)
 
-        num_mat = feat.select_dtypes(include=[np.number]).fillna(0.0).values
-        comps = self._pca_transform(num_mat)
+        num_df_for_pca = feat.select_dtypes(include=[np.number]).fillna(0.0).astype(np.float32)
+        comps = self._pca_transform(num_df_for_pca)
         if comps is not None:
             for i in range(comps.shape[1]):
                 feat[f"pca_{i+1}"] = comps[:, i]
