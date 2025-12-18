@@ -67,11 +67,7 @@ def run_activity_causal_analysis(
     Y = np.asarray(Y).ravel().astype(float)
 
     # 用 Y 的中位数填 NaN，供工厂内部监督用
-    y_for_factory = np.where(
-        np.isnan(Y),
-        np.nanmedian(Y[~np.isnan(Y)]) if np.any(~np.isnan(Y)) else 0.0,
-        Y
-    )
+    y_for_factory = None
 
     n_samples = len(Y)
     n_treated = int((T == 1).sum())
