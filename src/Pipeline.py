@@ -1,7 +1,4 @@
 # -*- coding: utf-8 -*-
-import sys
-sys.path.append(r"/mnt/workspace/act_causal_inference/src")
-
 import uuid
 import json
 from datetime import datetime
