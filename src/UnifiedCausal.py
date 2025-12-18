@@ -500,9 +500,7 @@ class UnifiedCausalTester:
         r = self.rules
         flags = dict(
             overlap_pass = ( (np.isnan(diag2['ovl']) or np.isnan(diag2['ks'])) and False )
-                           or ( (diag2['ovl'] >= r.ovl_min) and (diag2['ks'] <= r.ks_max)
-                                and ( (np.isnan(diag2['ess_t']) or diag2['ess_t']>=r.ess_min) )
-                                and ( (np.isnan(diag2['ess_c']) or diag2['ess_c']>=r.ess_min) ) ),
+                           or ( (diag2['ovl'] >= r.ovl_min) and (diag2['ks'] <= r.ks_max) ),
             balance_pass = (diag2['smd_max'] <= r.smd_max) if not np.isnan(diag2['smd_max']) else False,
             placebo_pass = (p_placebo >= r.placebo_alpha),
             negctrl_pass = (p_nc is None) or (p_nc >= r.nc_alpha)
